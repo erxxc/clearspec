@@ -1,0 +1,38 @@
+# semianalyst runtime configuration.
+# Loaded exclusively by src/semianalyst/config.py. Nothing else reads this file.
+
+[model]
+# Extraction model + prompt version. NOT wired up yet — extract/ is a stub this phase.
+# The API key is read from the ANTHROPIC_API_KEY environment variable, never stored here.
+name = "claude-opus-4-8"
+prompt_version = "extract_foundry_v1"
+
+[paths]
+data_dir = "data"
+raw_dir  = "data/raw"          # content-addressed raw docs, keyed by sha256
+db_path  = "data/semianalyst.db"
+
+[rate_limits]
+# Applied by the ingest fetchers once network fetch lands.
+requests_per_minute = 10
+max_concurrency     = 2
+
+# Watchlist of sources. doc_type and source_tier map to the schema enums:
+#   source_tier: 1=conference, 2=foundry, 3=vendor
+[[sources]]
+name        = "TSMC Technology"
+url         = "https://pr.tsmc.com/english/news"
+doc_type    = "foundry_announcement"
+source_tier = 2
+
+[[sources]]
+name        = "Samsung Foundry"
+url         = "https://semiconductor.samsung.com/foundry/newsroom/"
+doc_type    = "foundry_announcement"
+source_tier = 2
+
+[[sources]]
+name        = "Intel Foundry"
+url         = "https://www.intel.com/content/www/us/en/newsroom/home.html"
+doc_type    = "foundry_announcement"
+source_tier = 2

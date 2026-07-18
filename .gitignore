@@ -1,0 +1,24 @@
+# Data is never committed — raw docs, SQLite DB, and any derived artifacts live here.
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv lockfile is intentionally committed (reproducible installs); nothing to ignore there.
+
+# OS
+.DS_Store

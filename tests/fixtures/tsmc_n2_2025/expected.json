@@ -1,0 +1,68 @@
+{
+  "_note": "Golden expected output for the tsmc_n2_2025 fixture. Shape matches store.models.ExtractionResult dumped with mode='json'. The relative speed claim keeps its ratio (1.15x) and names its baseline (N3E) rather than being converted to an absolute — this fixture exists to lock in that rule.",
+  "entities": [
+    {
+      "entity_id": "tsmc_n2",
+      "entity_type": "process_node",
+      "vendor": "TSMC",
+      "name": "N2",
+      "aliases": ["N2"],
+      "node": {
+        "density_mtx_mm2": null,
+        "transistor_type": "gaa_nanosheet",
+        "backside_power": false,
+        "hvm_date_claimed": "2025-12-01",
+        "hvm_date_actual": null
+      },
+      "chip": null
+    },
+    {
+      "entity_id": "tsmc_n3e",
+      "entity_type": "process_node",
+      "vendor": "TSMC",
+      "name": "N3E",
+      "aliases": ["N3E"],
+      "node": {
+        "density_mtx_mm2": null,
+        "transistor_type": "finfet",
+        "backside_power": false,
+        "hvm_date_claimed": null,
+        "hvm_date_actual": null
+      },
+      "chip": null
+    }
+  ],
+  "claims": [
+    {
+      "claim_id": "tsmc_n2_speed_vs_n3e",
+      "doc_id": "tsmc_n2_2025",
+      "entity_id": "tsmc_n2",
+      "claim_class": "performance",
+      "metric": "logic_speed",
+      "value": 1.15,
+      "unit": "x",
+      "comparison": {
+        "is_relative": true,
+        "baseline_entity": "tsmc_n3e",
+        "baseline_stated": true
+      },
+      "conditions": {
+        "workload": null,
+        "precision": null,
+        "sparsity": null,
+        "thermal_config": null,
+        "stated_caveats": ["at iso-power"]
+      },
+      "completeness": "complete",
+      "citation": {
+        "page": 1,
+        "quote_span": "TSMC N2 delivers 1.15x logic speed at iso-power versus N3E.",
+        "location_type": "body"
+      },
+      "corroboration": {
+        "status": "uncorroborated",
+        "related_claim_ids": []
+      }
+    }
+  ]
+}

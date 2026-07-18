@@ -1,0 +1,107 @@
+# Semiconductor Technical Release — Extraction Schema v1
+# Design principles:
+#   1. The CLAIM is the atomic unit, not the document.
+#   2. A perf claim without baseline + conditions is stored but flagged incomplete.
+#   3. Every extracted value cites its source span (hallucination control).
+#   4. source_tier is set at document level and inherited by claims.
+
+# ---------------------------------------------------------------
+# DOCUMENT — one record per ingested release
+# ---------------------------------------------------------------
+document:
+  doc_id: string              # stable hash of canonical URL + version
+  title: string
+  publisher: string           # e.g. TSMC, NVIDIA, Hot Chips
+  doc_type: enum              # [foundry_announcement, conference_paper,
+                              #  vendor_whitepaper, product_brief]
+  source_tier: enum           # [1, 2, 3]  # conf=1, foundry=2, vendor=3
+  publish_date: date
+  url: string
+  file_sha256: string         # detect silent revisions of the same URL
+  ingest_date: date
+  extraction_model: string    # model + prompt version used, for re-runs
+  review_status: enum         # [unreviewed, human_verified, disputed]
+
+# ---------------------------------------------------------------
+# ENTITY — the thing a claim is about (product or process node)
+# ---------------------------------------------------------------
+entity:
+  entity_id: string
+  entity_type: enum           # [process_node, chip, chiplet, package, ip_block]
+  vendor: string
+  name: string                # e.g. "N2", "Blackwell B200", "18A"
+  aliases: [string]           # marketing names vs internal names
+  # --- node-level attributes (null for chips) ---
+  node:
+    density_mtx_mm2: number?          # MTr/mm² if disclosed
+    transistor_type: enum?            # [finfet, gaa_nanosheet, cfet]
+    backside_power: boolean?
+    hvm_date_claimed: date?           # claimed high-volume manufacturing
+    hvm_date_actual: date?            # backfilled later — slip tracking
+  # --- chip-level attributes (null for nodes) ---
+  chip:
+    process_node_ref: entity_id?      # FK to node entity — the join key
+    transistor_count_b: number?
+    die_size_mm2: number?
+    package_type: string?             # e.g. CoWoS-L, EMIB, InFO
+    memory_type: string?              # HBM3e, GDDR7, LPDDR5X
+    memory_bw_gbps: number?
+    tdp_w: number?
+    launch_date: date?
+
+# ---------------------------------------------------------------
+# CLAIM — the atomic unit. One row per quantitative assertion.
+# ---------------------------------------------------------------
+claim:
+  claim_id: string
+  doc_id: ref
+  entity_id: ref
+  claim_class: enum           # [performance, efficiency, density,
+                              #  power, yield, cost, availability]
+  metric: string              # normalized: "fp8_throughput", "perf_per_watt",
+                              #  "sram_density", "logic_density", etc.
+  value: number
+  unit: string
+  # --- the fields that make this an analyst tool, not a scraper ---
+  comparison:
+    is_relative: boolean      # "2.5x faster" vs absolute number
+    baseline_entity: entity_id?   # what it's compared AGAINST
+    baseline_stated: boolean      # did the doc actually name the baseline?
+  conditions:
+    workload: string?         # benchmark / precision / batch size
+    precision: string?        # FP4/FP8/FP16/INT8 — critical for AI claims
+    sparsity: boolean?        # the classic 2x inflation lever
+    thermal_config: string?   # air / liquid / unconstrained
+    stated_caveats: [string]  # verbatim footnote text
+  completeness: enum          # [complete, missing_baseline,
+                              #  missing_conditions, marketing_only]
+  citation:
+    page: int
+    quote_span: string        # exact source text supporting the value
+    location_type: enum       # [body, table, figure, footnote]
+                              # footnote-sourced claims deserve suspicion
+  corroboration:
+    status: enum              # [uncorroborated, corroborated, contradicted]
+    related_claim_ids: [ref]  # cross-tier links — the divergence detector
+
+# ---------------------------------------------------------------
+# MACRO — thin EDGAR layer, Phase 2 (kept minimal by design)
+# ---------------------------------------------------------------
+macro_snapshot:
+  vendor: string
+  period: string              # e.g. FY2026-Q2
+  capex_usd_m: number?
+  segment_revenue: map        # segment -> USD
+  inventory_days: number?
+  rd_spend_usd_m: number?
+  filing_url: string
+
+# ---------------------------------------------------------------
+# Normalization rules (enforced at extraction time)
+# ---------------------------------------------------------------
+# - All bandwidth to GB/s, power to W, density to MTr/mm², die to mm².
+# - Relative claims NEVER stored as computed absolutes; keep the ratio
+#   and the baseline ref so distortion stays visible.
+# - A claim with sparsity=true and a competitor comparison is auto-tagged
+#   completeness=marketing_only unless the competitor number is also sparse.
+# - Entity aliases resolved BEFORE claim insert; one entity per real thing.
