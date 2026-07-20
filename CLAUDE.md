@@ -4,14 +4,21 @@ Future sessions MUST respect these. They encode decisions that are expensive to
 reverse once data and prompts accumulate.
 
 ## The data model is the source of truth
-`schema/extraction_schema_v1.yaml` defines every structure. Pydantic models
-(`store/models.py`) and the SQLite DDL (`store/migrations/`) are both derived
-from it. Change the schema first; regenerate the models and add a migration —
-never the other way around.
+The schema defines every structure; pydantic models (`store/models.py`) and the
+SQLite DDL (`store/migrations/`) are both derived from it. Change the schema
+first; regenerate the models and add a migration — never the other way around.
+**`schema/extraction_schema_v2.yaml` is current** (extraction targets v2);
+`_v1.yaml` is retained unedited. v2 added per-attribute grounding for entity
+attributes (`entity.attribute_citations`) and a fail-safe `unknown` value on
+`citation.location_type`.
 
 ## The claim is the atomic unit — and its integrity rules are non-negotiable
-- **Every extracted value cites a source span** (`claim.citation.quote_span`).
-  A value with no citation is not a claim.
+- **Every extracted value cites a source span** — code-enforced, not trusted to
+  the model. `extract/validate.py` drops any claim whose `citation.quote_span`
+  isn't a (whitespace-normalized) substring of the source, and nulls any entity
+  attribute whose `attribute_citations` entry isn't grounded (v2). The LLM output
+  is a PROPOSAL; validation is the guarantee. `location_type` fails safe to
+  `unknown` under flat-text extraction (never laundered to `body`).
 - **Relative claims are never converted to absolutes.** Store the ratio and the
   baseline reference (`comparison.is_relative`, `comparison.baseline_entity`) so
   the distortion stays visible. "2.5x faster" is stored as `2.5` + baseline, not
@@ -37,6 +44,16 @@ ever interpolated into SQL text. Schema changes ship as new numbered migrations
 live on the filesystem under `data/raw/`, content-addressed — that is ingest's
 concern, not the database's.)
 
+**Cross-document entity reconciliation is an open PREREQUISITE for persistence.**
+The inserts use plain `INSERT` (a duplicate primary key **raises**, not silently
+overwrites) — because `entity_id`/`claim_id` are model-derived and shared across
+documents, so a naive `INSERT OR REPLACE` would let a later (or hostile) document
+clobber an entity an earlier document created, destroying corroboration. Do NOT
+wire `run_extract` → `insert_*` until the persistence workstream defines how a
+second document naming an existing entity is merged/versioned. `validate.py`
+enforces a per-DOCUMENT trust boundary only (a claim must reference an entity from
+its own proposal); cross-document trust is the store workstream's job.
+
 ## Prompts and the schema are versioned artifacts, not edited in place
 A prompt change means a NEW file (`extract_foundry_v2.md`), so every extraction
 run stays tied to the exact prompt bytes (`PromptVersion.sha256`) and model that
@@ -60,12 +77,17 @@ gitignored in full.
 - `analyze/` — cross-source corroboration + divergence (future work)
 - `cli.py`   — thin argument layer over the above
 
-## Testing
+## Testing (ENFORCE posture)
 `tests/` uses a golden-fixture harness: `tests/fixtures/<doc_id>/raw.pdf` +
-`expected.json`, diffed against extractor output. It is the QA backbone — keep it
-green (the extraction case `xfail`s strictly until the extractor lands, then the
-marker is removed). Store/ingest/prompt behavior is covered by real
-(non-`xfail`) tests.
+`expected.json`, diffed against extractor output. The **real model is the
+anchor**: `@live` tests (`test_golden_live`, `test_injection_live`) run the actual
+extractor and are the true gate — `uv run pytest --run-live` (with
+`ANTHROPIC_API_KEY`) is what proves the extractor works. A plain `uv run pytest`
+never fabricates model output: the offline golden replays a real, provenance-
+stamped `llm_response.json` (skips until recorded via `--run-live --record`), and
+`test_validate.py` covers the validation pipeline deterministically. Never let a
+green offline run stand in for live coverage. Store/ingest/prompt have their own
+real tests.
 
 ## Review gates (swarm)
 Significant workstreams pass an adversarial review gate before commit: biased

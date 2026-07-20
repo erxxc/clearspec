@@ -92,11 +92,14 @@ def _enum(value: object | None) -> object | None:
 
 
 # --------------------------------------------------------------------------
-# Inserts (parameterized; upsert on primary key)
+# Inserts (parameterized). Plain INSERT — a duplicate primary key RAISES rather
+# than silently overwriting. Cross-document reconciliation (a later doc naming an
+# entity an earlier doc created) is a deliberate open task for the persistence
+# workstream; until it lands, fail loud instead of clobbering. See CLAUDE.md.
 # --------------------------------------------------------------------------
 def insert_document(conn: sqlite3.Connection, doc: models.Document) -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO document "
+        "INSERT INTO document"
         "(doc_id, title, publisher, doc_type, source_tier, publish_date, url, "
         " file_sha256, ingest_date, extraction_model, review_status) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -112,15 +115,20 @@ def insert_document(conn: sqlite3.Connection, doc: models.Document) -> None:
 def insert_entity(conn: sqlite3.Connection, ent: models.Entity) -> None:
     node = ent.node or models.NodeAttributes()
     chip = ent.chip or models.ChipAttributes()
+    # v2: attribute-path -> citation, serialized as a JSON map (mode="json"
+    # renders the LocationType enum + int page as JSON scalars).
+    attr_cites = {
+        path: cite.model_dump(mode="json") for path, cite in ent.attribute_citations.items()
+    }
     conn.execute(
-        "INSERT OR REPLACE INTO entity "
+        "INSERT INTO entity"
         "(entity_id, entity_type, vendor, name, aliases, "
         " node_density_mtx_mm2, node_transistor_type, node_backside_power, "
         " node_hvm_date_claimed, node_hvm_date_actual, "
         " chip_process_node_ref, chip_transistor_count_b, chip_die_size_mm2, "
         " chip_package_type, chip_memory_type, chip_memory_bw_gbps, chip_tdp_w, "
-        " chip_launch_date) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " chip_launch_date, attribute_citations) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             ent.entity_id, _enum(ent.entity_type), ent.vendor, ent.name,
             json.dumps(ent.aliases),
@@ -129,7 +137,7 @@ def insert_entity(conn: sqlite3.Connection, ent: models.Entity) -> None:
             _d(node.hvm_date_actual),
             chip.process_node_ref, chip.transistor_count_b, chip.die_size_mm2,
             chip.package_type, chip.memory_type, chip.memory_bw_gbps, chip.tdp_w,
-            _d(chip.launch_date),
+            _d(chip.launch_date), json.dumps(attr_cites),
         ),
     )
 
@@ -137,7 +145,7 @@ def insert_entity(conn: sqlite3.Connection, ent: models.Entity) -> None:
 def insert_claim(conn: sqlite3.Connection, claim: models.Claim) -> None:
     c = claim
     conn.execute(
-        "INSERT OR REPLACE INTO claim "
+        "INSERT INTO claim"
         "(claim_id, doc_id, entity_id, claim_class, metric, value, unit, "
         " cmp_is_relative, cmp_baseline_entity, cmp_baseline_stated, "
         " cond_workload, cond_precision, cond_sparsity, cond_thermal_config, "

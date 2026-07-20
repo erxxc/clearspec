@@ -1,35 +1,36 @@
 {
-  "_note": "Golden expected output (schema v2). Shape matches extract.ExtractionResult.model_dump(mode='json'). Every entity attribute now carries a grounded attribute_citation, and every location_type is 'unknown' — validate.py forces that under flat-text extraction (fail-safe), rather than laundering claims into 'body'. The relative speed claim keeps its ratio (1.15x) and names its baseline (N3E). All quote_spans are verbatim substrings of raw.pdf.",
   "entities": [
     {
       "entity_id": "tsmc_n2",
       "entity_type": "process_node",
       "vendor": "TSMC",
       "name": "N2",
-      "aliases": ["N2"],
+      "aliases": [
+        "N2"
+      ],
       "node": {
         "density_mtx_mm2": null,
         "transistor_type": "gaa_nanosheet",
         "backside_power": false,
-        "hvm_date_claimed": "2025-12-01",
+        "hvm_date_claimed": "December 2025",
         "hvm_date_actual": null
       },
       "chip": null,
       "attribute_citations": {
         "node.transistor_type": {
-          "page": 1,
           "quote_span": "N2 is TSMC's first gate-all-around (GAA) nanosheet process node.",
-          "location_type": "unknown"
+          "page": 1,
+          "location_type": "body"
         },
         "node.backside_power": {
-          "page": 1,
           "quote_span": "N2 does not use backside power delivery.",
-          "location_type": "unknown"
+          "page": 1,
+          "location_type": "body"
         },
         "node.hvm_date_claimed": {
-          "page": 1,
           "quote_span": "N2 enters high-volume manufacturing in December 2025.",
-          "location_type": "unknown"
+          "page": 1,
+          "location_type": "body"
         }
       }
     },
@@ -38,7 +39,9 @@
       "entity_type": "process_node",
       "vendor": "TSMC",
       "name": "N3E",
-      "aliases": ["N3E"],
+      "aliases": [
+        "N3E"
+      ],
       "node": {
         "density_mtx_mm2": null,
         "transistor_type": "finfet",
@@ -49,14 +52,14 @@
       "chip": null,
       "attribute_citations": {
         "node.transistor_type": {
-          "page": 1,
           "quote_span": "The prior-generation TSMC N3E node uses FinFET transistors.",
-          "location_type": "unknown"
+          "page": 1,
+          "location_type": "body"
         },
         "node.backside_power": {
-          "page": 1,
           "quote_span": "N3E does not use backside power delivery.",
-          "location_type": "unknown"
+          "page": 1,
+          "location_type": "body"
         }
       }
     }
@@ -64,7 +67,6 @@
   "claims": [
     {
       "claim_id": "tsmc_n2_logic_speed",
-      "doc_id": "tsmc_n2_2025",
       "entity_id": "tsmc_n2",
       "claim_class": "performance",
       "metric": "logic_speed",
@@ -80,18 +82,25 @@
         "precision": null,
         "sparsity": null,
         "thermal_config": null,
-        "stated_caveats": ["at iso-power"]
+        "stated_caveats": [
+          "at iso-power"
+        ]
       },
       "completeness": "complete",
       "citation": {
-        "page": 1,
         "quote_span": "TSMC N2 delivers 1.15x logic speed at iso-power versus N3E.",
-        "location_type": "unknown"
+        "page": 1,
+        "location_type": "body"
       },
       "corroboration": {
         "status": "uncorroborated",
         "related_claim_ids": []
-      }
+      },
+      "doc_id": "tsmc_n2_2025"
     }
-  ]
+  ],
+  "_recorded_against": {
+    "prompt_sha256": "1e7792eb646db062482d7aa4148d76f6555de38e4f814f8f4335ca44ba2bd156",
+    "model": "claude-opus-4-8"
+  }
 }

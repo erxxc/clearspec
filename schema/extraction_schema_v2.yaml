@@ -1,0 +1,139 @@
+# Semiconductor Technical Release — Extraction Schema v2
+# Supersedes v1 (schema/extraction_schema_v1.yaml). v1 is retained unedited;
+# this is a NEW versioned file per the "schema is a versioned artifact" rule.
+#
+# What changed from v1, and why (GATE-1 resolution, 2026-07-18):
+#   * entity.attribute_citations (NEW): a per-attribute citation slot so entity
+#     node/chip attributes get the SAME code-enforced grounding that claims get.
+#     v1 grounded only claim values; entity attributes (transistor_type,
+#     hvm_date_claimed, ...) were groundable by prompt discipline alone — the
+#     exact world-knowledge-injection gap that corrupted the golden fixture once.
+#   * citation.location_type gains `unknown` (NEW): flat-text extraction cannot
+#     distinguish body/table/footnote, so it FAILS SAFE to `unknown` rather than
+#     laundering a (suspicious) footnote-sourced claim into the trusted `body`
+#     bucket. Real locations are assigned once layout-aware extraction lands.
+#
+# Design principles (unchanged from v1):
+#   1. The CLAIM is the atomic unit, not the document.
+#   2. A perf claim without baseline + conditions is stored but flagged incomplete.
+#   3. Every extracted value cites its source span (hallucination control) —
+#      now enforced for entity attributes too (attribute_citations).
+#   4. source_tier is set at document level and inherited by claims.
+
+# ---------------------------------------------------------------
+# DOCUMENT — one record per ingested release (unchanged from v1)
+# ---------------------------------------------------------------
+document:
+  doc_id: string
+  title: string
+  publisher: string
+  doc_type: enum              # [foundry_announcement, conference_paper,
+                              #  vendor_whitepaper, product_brief]
+  source_tier: enum           # [1, 2, 3]  # conf=1, foundry=2, vendor=3
+  publish_date: date
+  url: string
+  file_sha256: string
+  ingest_date: date
+  extraction_model: string    # model + prompt version + prompt sha256, for re-runs
+  review_status: enum         # [unreviewed, human_verified, disputed]
+
+# ---------------------------------------------------------------
+# CITATION — a grounded source span. Reused by claims AND, in v2, by entity
+# attributes. location_type gains `unknown` (fail-safe default for flat text).
+# ---------------------------------------------------------------
+citation:
+  page: int?
+  quote_span: string          # exact source text supporting the value
+  location_type: enum         # [body, table, figure, footnote, unknown]
+                              # footnote-sourced claims deserve suspicion;
+                              # `unknown` = location undetermined, treat as suspect
+
+# ---------------------------------------------------------------
+# ENTITY — the thing a claim is about (product or process node)
+# ---------------------------------------------------------------
+entity:
+  entity_id: string
+  entity_type: enum           # [process_node, chip, chiplet, package, ip_block]
+  vendor: string
+  name: string
+  aliases: [string]
+  # --- node-level attributes (null for chips) ---
+  node:
+    density_mtx_mm2: number?
+    transistor_type: enum?            # [finfet, gaa_nanosheet, cfet]
+    backside_power: boolean?
+    hvm_date_claimed: date?
+    hvm_date_actual: date?            # backfilled later — slip tracking
+  # --- chip-level attributes (null for nodes) ---
+  chip:
+    process_node_ref: entity_id?      # FK to node entity — the join key
+    transistor_count_b: number?
+    die_size_mm2: number?
+    package_type: string?
+    memory_type: string?
+    memory_bw_gbps: number?
+    tdp_w: number?
+    launch_date: date?
+  # --- NEW in v2: per-attribute grounding ---
+  attribute_citations: map           # attribute-path -> citation, e.g.
+                                      #   "node.transistor_type": {quote_span, page, location_type}
+                                      # EVERY non-null node/chip attribute MUST have
+                                      # a citation whose quote_span appears in the
+                                      # source (enforced in extract/validate.py).
+                                      # hvm_date_actual is exempt (backfilled, not
+                                      # extracted from the release).
+
+# ---------------------------------------------------------------
+# CLAIM — the atomic unit. One row per quantitative assertion.
+# ---------------------------------------------------------------
+claim:
+  claim_id: string
+  doc_id: ref
+  entity_id: ref
+  claim_class: enum           # [performance, efficiency, density,
+                              #  power, yield, cost, availability]
+  metric: string
+  value: number
+  unit: string
+  comparison:
+    is_relative: boolean
+    baseline_entity: entity_id?
+    baseline_stated: boolean
+  conditions:
+    workload: string?
+    precision: string?
+    sparsity: boolean?
+    thermal_config: string?
+    stated_caveats: [string]
+  completeness: enum          # [complete, missing_baseline,
+                              #  missing_conditions, marketing_only]
+  citation: citation          # (see CITATION above)
+  corroboration:
+    status: enum              # [uncorroborated, corroborated, contradicted]
+    related_claim_ids: [ref]
+
+# ---------------------------------------------------------------
+# MACRO — thin EDGAR layer, Phase 2 (unchanged from v1)
+# ---------------------------------------------------------------
+macro_snapshot:
+  vendor: string
+  period: string
+  capex_usd_m: number?
+  segment_revenue: map
+  inventory_days: number?
+  rd_spend_usd_m: number?
+  filing_url: string
+
+# ---------------------------------------------------------------
+# Normalization rules (enforced at extraction time — extract/validate.py)
+# ---------------------------------------------------------------
+# - All bandwidth to GB/s, power to W, density to MTr/mm², die to mm².
+# - Relative claims NEVER stored as computed absolutes; keep ratio + baseline ref.
+# - sparsity=true + competitor comparison whose competitor number isn't also
+#   sparse -> completeness=marketing_only.
+# - Entity aliases resolved BEFORE claim insert; one entity per real thing.
+# - Month-precision dates normalize to first-of-month ("December 2025"->2025-12-01).
+# - Every claim.citation.quote_span AND every attribute_citations[*].quote_span
+#   MUST be a (whitespace-normalized) substring of the source text, or it is
+#   rejected. Grounding is code-enforced, never trusted to the model.
+# - location_type is `unknown` under flat-text extraction (fail-safe).

@@ -10,7 +10,7 @@ from semianalyst.extract import PromptVersion
 def test_prompt_version_loads():
     pv = PromptVersion.load("extract_foundry_v1")
     assert pv.name == "extract_foundry_v1"
-    assert "Foundry" in pv.text
+    assert "quote_span" in pv.text  # the grounding instruction is the prompt's core
     assert len(pv.sha256) == 64 and all(c in "0123456789abcdef" for c in pv.sha256)
 
 

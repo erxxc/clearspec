@@ -1,15 +1,15 @@
-"""Canonical pydantic models — generated from schema/extraction_schema_v1.yaml.
+"""Canonical pydantic models — generated from schema/extraction_schema_v2.yaml.
 
 These mirror the schema's *nested* shape (claim.comparison, claim.conditions,
-entity.node, entity.chip, ...). The relational storage layer (db.py) flattens
-them into columns; keeping the models nested keeps the schema's semantics
-legible and keeps the store as the only place that knows about SQL.
+entity.node, entity.chip, entity.attribute_citations, ...). The relational
+storage layer (db.py) flattens them into columns; keeping the models nested
+keeps the schema's semantics legible and confines SQL knowledge to the store.
 
 Design invariants carried from the schema (see CLAUDE.md):
   - The claim is the atomic unit.
-  - Relative claims keep the ratio + baseline ref; they are NEVER converted to
-    absolutes (Comparison.is_relative / baseline_entity).
-  - Every value cites a source span (Citation.quote_span).
+  - Relative claims keep the ratio + baseline ref; they are NEVER absolutized.
+  - Every claim value AND every non-null entity attribute cites a source span
+    (Citation / attribute_citations) — grounding is code-enforced (v2).
   - source_tier is set at the document level and inherited by claims.
 """
 
@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict
 
 
 # --------------------------------------------------------------------------
-# Enums (from the schema's `enum` annotations)
+# Enums
 # --------------------------------------------------------------------------
 class DocType(str, enum.Enum):
     foundry_announcement = "foundry_announcement"
@@ -79,13 +79,23 @@ class LocationType(str, enum.Enum):
     body = "body"
     table = "table"
     figure = "figure"
-    footnote = "footnote"  # footnote-sourced claims deserve suspicion
+    footnote = "footnote"     # footnote-sourced claims deserve suspicion
+    unknown = "unknown"       # v2: location undetermined (flat text) — fail-safe
 
 
 class CorroborationStatus(str, enum.Enum):
     uncorroborated = "uncorroborated"
     corroborated = "corroborated"
     contradicted = "contradicted"
+
+
+# --------------------------------------------------------------------------
+# CITATION — a grounded source span. Reused by claims AND entity attributes (v2).
+# --------------------------------------------------------------------------
+class Citation(BaseModel):
+    page: int | None = None
+    quote_span: str                  # exact source text supporting the value
+    location_type: LocationType
 
 
 # --------------------------------------------------------------------------
@@ -108,7 +118,7 @@ class Document(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# ENTITY (with node / chip sub-attributes)
+# ENTITY (with node / chip sub-attributes + per-attribute grounding)
 # --------------------------------------------------------------------------
 class NodeAttributes(BaseModel):
     density_mtx_mm2: float | None = None
@@ -137,6 +147,9 @@ class Entity(BaseModel):
     aliases: list[str] = []
     node: NodeAttributes | None = None
     chip: ChipAttributes | None = None
+    # v2: attribute-path -> Citation. Every non-null node/chip attribute (except
+    # hvm_date_actual, which is backfilled) must have a grounded citation here.
+    attribute_citations: dict[str, Citation] = {}
 
 
 # --------------------------------------------------------------------------
@@ -154,12 +167,6 @@ class Conditions(BaseModel):
     sparsity: bool | None = None     # the classic 2x inflation lever
     thermal_config: str | None = None
     stated_caveats: list[str] = []   # verbatim footnote text
-
-
-class Citation(BaseModel):
-    page: int | None = None
-    quote_span: str                  # exact source text supporting the value
-    location_type: LocationType
 
 
 class Corroboration(BaseModel):

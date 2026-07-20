@@ -9,6 +9,8 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.7",
     "pyyaml>=6.0",
+    "anthropic>=0.40",   # extraction model call (GATE-1 approved dependency)
+    "pypdf>=5.0",        # PDF -> text for the extractor
 ]
 
 [project.optional-dependencies]
@@ -28,7 +30,12 @@ packages = ["src/semianalyst"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-xfail_strict = false  # extract is stubbed; golden harness xfails until it lands
+markers = [
+    # ENFORCE posture: these hit the real Anthropic model. Skipped unless
+    # `--run-live` is passed AND ANTHROPIC_API_KEY is set. They are the
+    # mandatory CI anchor — `uv run pytest --run-live` is the real gate.
+    "live: exercises the real Anthropic model (needs --run-live + ANTHROPIC_API_KEY)",
+]
 
 [dependency-groups]
 # uv reads this for `uv sync`; mirrors the [dev] extra above.
