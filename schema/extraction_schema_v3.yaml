@@ -1,0 +1,42 @@
+# Semiconductor Technical Release — Extraction Schema v3
+# Supersedes v2 (schema/extraction_schema_v2.yaml), which is retained unedited.
+#
+# What changed from v2 (analyze GATE-1 v2 + GATE-2 resolutions, 2026-07-20):
+#   * corroboration.status gains `weakly_corroborated` (NEW) as a valid verdict
+#     VALUE. A group of >=2 claims that AGREE within tolerance but has fewer than 2
+#     NON-SUSPECT members (e.g. a foundry's clean number + a vendor deck that
+#     honestly discloses sparsity) is not `corroborated` (a suspect number must not
+#     validate a clean one) yet is not `contradicted` (they agree) nor a singleton
+#     — the v2 3-value enum had no slot for this common, honest pattern.
+#   * corroboration is now DERIVED, NOT PERSISTED (decision B2). It is a per-GROUP
+#     verdict analyze computes derive-on-read (the AnalysisReport), never a stored
+#     per-row column. The v2 persisted corr_status/corr_related_claim_ids columns
+#     are DROPPED in migration 0003: a per-row column for a per-group fact read
+#     'uncorroborated' on every row regardless of the true verdict. The store holds
+#     no verdict; read the AnalysisReport.
+#   * migration 0003 also drops the cmp_baseline_entity FK (cross-doc / dangling
+#     baselines are kept and flagged `unresolved_baseline`, not rejected).
+#
+# Everything else is identical to v2 (entity.attribute_citations, the `unknown`
+# location_type, per-attribute grounding, all other blocks). Only the changed
+# block is shown in full below; see extraction_schema_v2.yaml for the rest.
+
+# ---------------------------------------------------------------
+# CLAIM.corroboration — the divergence/agreement verdict (v3)
+#   DERIVED, NOT PERSISTED. Present on the in-memory claim with a neutral default
+#   so extraction output has a stable shape; analyze computes the real verdict on
+#   read (analyze/corroborate.py -> AnalysisReport). No per-row DB column exists.
+# ---------------------------------------------------------------
+claim:
+  # ... doc_id/entity_id/claim_class/metric/value/unit/comparison/conditions/
+  #     completeness/citation identical to v2 ...
+  corroboration:               # derived (analyze output), not stored on the claim row
+    status: enum              # [uncorroborated, corroborated,
+                              #  weakly_corroborated, contradicted]
+                              #  weakly_corroborated (v3): >=2 members agree within
+                              #  tolerance but <2 are non-suspect (sparsity /
+                              #  marketing_only rode along) — a hedged agreement.
+    related_claim_ids: [ref]  # the other members of this claim's group
+
+# All other blocks (document, citation, entity, macro_snapshot, normalization
+# rules) are unchanged from extraction_schema_v2.yaml.

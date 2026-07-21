@@ -226,6 +226,21 @@ def test_marketing_only_tagging_cross_vendor_sparsity():
     assert result.claims[0].completeness.value == "marketing_only"
 
 
+def test_sparsity_with_unresolved_baseline_is_not_marketing_only():
+    """The cross-vendor marketing_only test needs BOTH vendors known. A same-vendor
+    sparsity claim whose baseline isn't declared (None vendor) must NOT be tagged
+    marketing_only — that misfire was the bug the analyze gate surfaced."""
+    src = "N2 is 2x versus N3E with sparsity on."
+    p = {"entities": [_entity("tsmc_n2", "TSMC", "N2")],  # N3E baseline NOT declared here
+         "claims": [_claim(entity_id="tsmc_n2", value=2, unit="x",
+             comparison={"is_relative": True, "baseline_entity": "tsmc_n3e", "baseline_stated": True},
+             conditions={"sparsity": True, "stated_caveats": ["with sparsity on"]},
+             completeness="complete",
+             citation={"quote_span": "N2 is 2x versus N3E with sparsity on.", "location_type": "body"})]}
+    result, _ = validate_proposal(p, src)
+    assert result.claims[0].completeness.value != "marketing_only"
+
+
 def test_shape_invalid_claim_is_dropped_not_fatal():
     """An off-type field (real models emit sparsity='enabled') drops that claim,
     never the whole extraction — the other grounded claims survive."""

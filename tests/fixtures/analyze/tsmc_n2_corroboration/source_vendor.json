@@ -1,0 +1,39 @@
+{
+  "_note": "Source 3 of 3 — vendor marketing slide (tier 3, lowest trust). perf_per_watt CONTRADICTS the foundry number (1.8x vs 1.3x) via the sparsity lever; throughput stands alone; a density claim cites 'Intel 18A' as baseline — an entity NEVER ingested (a dangling cross-document reference, exercising P2). completeness is 'complete' (the conditions, incl. sparsity, ARE disclosed); suspicion is an analyze-layer signal (sparsity / unresolved baseline / tier), NOT marketing_only, because N2-vs-N3E is a same-vendor comparison.",
+  "document": {
+    "doc_id": "vendorslide", "title": "Accelerate on N2 — Partner Deck",
+    "publisher": "AcmeAccel", "doc_type": "vendor_whitepaper", "source_tier": 3,
+    "publish_date": "2026-01-02", "url": "https://acme.example/n2-deck",
+    "file_sha256": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+    "ingest_date": "2026-01-07"
+  },
+  "entities": [
+    {"entity_id": "tsmc_n2", "entity_type": "process_node", "vendor": "TSMC", "name": "N2", "aliases": ["N2", "2nm-class"]}
+  ],
+  "claims": [
+    {"claim_id": "vendorslide:perf_per_watt", "doc_id": "vendorslide", "entity_id": "tsmc_n2",
+     "claim_class": "efficiency", "metric": "perf_per_watt", "value": 1.8, "unit": "x",
+     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
+     "conditions": {"sparsity": true, "stated_caveats": ["with sparsity enabled"]},
+     "completeness": "complete",
+     "citation": {"page": 1, "quote_span": "Up to 1.8x perf/W vs N3E with sparsity enabled", "location_type": "unknown"}},
+    {"claim_id": "vendorslide:throughput", "doc_id": "vendorslide", "entity_id": "tsmc_n2",
+     "claim_class": "performance", "metric": "throughput", "value": 2.0, "unit": "x",
+     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
+     "conditions": {"sparsity": true, "stated_caveats": ["with sparsity enabled"]},
+     "completeness": "complete",
+     "citation": {"page": 2, "quote_span": "2x throughput vs N3E with sparsity enabled", "location_type": "unknown"}},
+    {"claim_id": "vendorslide:vs_intel", "doc_id": "vendorslide", "entity_id": "tsmc_n2",
+     "claim_class": "density", "metric": "logic_density", "value": 3.0, "unit": "x",
+     "comparison": {"is_relative": true, "baseline_entity": "intel_18a", "baseline_stated": true},
+     "conditions": {"stated_caveats": []},
+     "completeness": "complete",
+     "citation": {"page": 3, "quote_span": "3x logic density versus Intel 18A", "location_type": "unknown"}},
+    {"claim_id": "vendorslide:sram_density", "doc_id": "vendorslide", "entity_id": "tsmc_n2",
+     "claim_class": "density", "metric": "sram_density", "value": 1.25, "unit": "x",
+     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
+     "conditions": {"sparsity": true, "stated_caveats": ["with sparsity-aware cells"]},
+     "completeness": "complete",
+     "citation": {"page": 2, "quote_span": "1.25x SRAM density vs N3E with sparsity-aware cells", "location_type": "unknown"}}
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "_note": "Source 2 of 3 — Hot Chips conference paper (tier 1, highest trust). Corroborates the foundry logic_speed within tolerance; calls N2 'TSMC 2nm' (alias-union test).",
+  "document": {
+    "doc_id": "hotchips_n2", "title": "A 2nm-class GAA Nanosheet Platform",
+    "publisher": "Hot Chips", "doc_type": "conference_paper", "source_tier": 1,
+    "publish_date": "2025-08-20", "url": "https://hotchips.example/n2",
+    "file_sha256": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "ingest_date": "2026-01-06"
+  },
+  "entities": [
+    {"entity_id": "tsmc_n2", "entity_type": "process_node", "vendor": "TSMC", "name": "N2", "aliases": ["N2", "TSMC 2nm"]},
+    {"entity_id": "tsmc_n3e", "entity_type": "process_node", "vendor": "TSMC", "name": "N3E", "aliases": ["N3E"]}
+  ],
+  "claims": [
+    {"claim_id": "hotchips_n2:logic_speed", "doc_id": "hotchips_n2", "entity_id": "tsmc_n2",
+     "claim_class": "performance", "metric": "logic_speed", "value": 1.18, "unit": "x",
+     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
+     "conditions": {"stated_caveats": []},
+     "completeness": "complete",
+     "citation": {"page": 4, "quote_span": "measured 1.18x ring-oscillator speed over N3E", "location_type": "unknown"}}
+  ]
+}

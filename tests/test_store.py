@@ -20,7 +20,7 @@ def test_init_db_creates_schema(tmp_config):
     try:
         assert {"document", "entity", "claim", "macro_snapshot", "schema_migrations"} <= _tables(conn)
         applied = conn.execute("SELECT version FROM schema_migrations").fetchall()
-        assert [r["version"] for r in applied] == [1, 2]  # 0001 initial + 0002 v2 grounding
+        assert [r["version"] for r in applied] == [1, 2, 3]  # initial + v2 grounding + v3 weakly_corroborated
     finally:
         conn.close()
 
@@ -31,7 +31,7 @@ def test_init_db_is_idempotent(tmp_config):
     conn = store.connect(tmp_config.paths.db_path)
     try:
         n = conn.execute("SELECT COUNT(*) AS n FROM schema_migrations").fetchone()["n"]
-        assert n == 2  # both migrations applied once; second init_db is a no-op
+        assert n == 3  # all migrations applied once; second init_db is a no-op
     finally:
         conn.close()
 

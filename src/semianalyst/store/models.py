@@ -86,6 +86,7 @@ class LocationType(str, enum.Enum):
 class CorroborationStatus(str, enum.Enum):
     uncorroborated = "uncorroborated"
     corroborated = "corroborated"
+    weakly_corroborated = "weakly_corroborated"  # v3: >=2 agree within tolerance, <2 non-suspect
     contradicted = "contradicted"
 
 
@@ -170,6 +171,13 @@ class Conditions(BaseModel):
 
 
 class Corroboration(BaseModel):
+    # DERIVED, NOT PERSISTED (v3 / decision B2). The corroboration verdict is a
+    # per-GROUP fact analyze computes derive-on-read (see analyze/corroborate.py →
+    # AnalysisReport); it is NOT stored on the claim row. This field carries a
+    # neutral default on the in-memory claim so extraction output has a stable
+    # shape, but `store.insert_claim` never writes it and no row-to-claim reader
+    # reads it back. Do not add a persisted per-row verdict without settling the
+    # per-group-fact-in-a-per-row-home question (CLAUDE.md, analyze resolution).
     status: CorroborationStatus = CorroborationStatus.uncorroborated
     related_claim_ids: list[str] = []
 

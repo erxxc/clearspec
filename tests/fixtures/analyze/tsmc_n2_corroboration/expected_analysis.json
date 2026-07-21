@@ -1,0 +1,48 @@
+{
+  "_note": "MVP acceptance verdict for analyze v1 (schema v3). Load the 3 sources -> persist with reconciliation -> run_analysis -> this (== AnalysisReport.to_dict()). Demonstrates the value on HONEST data: logic_speed corroborated (tier 1+2), perf_per_watt contradicted (foundry iso 1.3x vs vendor sparsity 1.8x, favored tier 2), sram_density WEAKLY corroborated (clean 1.2x + sparsity 1.25x agree within tolerance but only 1 non-suspect member), throughput/yield_rate/logic_density uncorroborated (single source; the last with a dangling Intel-18A baseline flagged). A sparsity number never makes a group 'corroborated'; relative claims compare only within a shared baseline; an absolute % claim (yield) is handled, never grouped with a relative one. Hostile-source guards are deferred (Class A, see CLAUDE.md); a naive-vs-hardened diff is invisible on honest data by design.",
+  "entities_reconciled": {
+    "tsmc_n2": {"aliases": ["2nm-class", "N2", "TSMC 2nm"]},
+    "tsmc_n3e": {"aliases": ["N3E"]}
+  },
+  "assessments": [
+    {
+      "entity_id": "tsmc_n2", "metric": "logic_density", "baseline_entity": "intel_18a",
+      "status": "uncorroborated", "members": ["vendorslide:vs_intel"],
+      "value_range": [3.0, 3.0], "spread_pct": 0.0, "tiers": [3],
+      "confidence": "none", "flags": ["single_source", "unresolved_baseline"]
+    },
+    {
+      "entity_id": "tsmc_n2", "metric": "logic_speed", "baseline_entity": "tsmc_n3e",
+      "status": "corroborated",
+      "members": ["hotchips_n2:logic_speed", "tsmc_pr_n2:logic_speed"],
+      "value_range": [1.15, 1.18], "spread_pct": 2.5, "tiers": [1, 2],
+      "confidence": "high", "flags": []
+    },
+    {
+      "entity_id": "tsmc_n2", "metric": "perf_per_watt", "baseline_entity": "tsmc_n3e",
+      "status": "contradicted",
+      "members": ["tsmc_pr_n2:perf_per_watt", "vendorslide:perf_per_watt"],
+      "value_range": [1.3, 1.8], "spread_pct": 27.8, "tiers": [2, 3],
+      "confidence": "low", "flags": ["sparsity"], "favored_tier": 2
+    },
+    {
+      "entity_id": "tsmc_n2", "metric": "sram_density", "baseline_entity": "tsmc_n3e",
+      "status": "weakly_corroborated",
+      "members": ["tsmc_pr_n2:sram_density", "vendorslide:sram_density"],
+      "value_range": [1.2, 1.25], "spread_pct": 4.0, "tiers": [2, 3],
+      "confidence": "medium", "flags": ["sparsity"]
+    },
+    {
+      "entity_id": "tsmc_n2", "metric": "throughput", "baseline_entity": "tsmc_n3e",
+      "status": "uncorroborated", "members": ["vendorslide:throughput"],
+      "value_range": [2.0, 2.0], "spread_pct": 0.0, "tiers": [3],
+      "confidence": "none", "flags": ["single_source", "sparsity"]
+    },
+    {
+      "entity_id": "tsmc_n2", "metric": "yield_rate", "baseline_entity": null,
+      "status": "uncorroborated", "members": ["tsmc_pr_n2:yield_rate"],
+      "value_range": [65.0, 65.0], "spread_pct": 0.0, "tiers": [2],
+      "confidence": "none", "flags": ["single_source"]
+    }
+  ]
+}
