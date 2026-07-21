@@ -12,6 +12,7 @@ from __future__ import annotations
 import typer
 
 from . import store
+from .analyze import run_analysis
 from .config import load_config
 from .extract.pipeline import run_extract
 from .ingest.pipeline import run_ingest
@@ -59,9 +60,21 @@ def extract() -> None:
 
 @app.command()
 def report() -> None:
-    """Print a summary of stored documents, entities, and claims."""
-    for table, count in store.report_counts(load_config()).items():
-        typer.echo(f"{table}: {count}")
+    """Print cross-source corroboration and divergence per entity + metric."""
+    analysis = run_analysis(load_config())
+    if not analysis.assessments:
+        typer.echo("no claims in the store — nothing to corroborate yet.")
+        return
+    for entity_id, info in analysis.entities_reconciled.items():
+        typer.echo(f"{entity_id}  aliases={info['aliases']}")
+    for a in analysis.assessments:
+        line = f"  [{a.status}] {a.metric}"
+        if a.baseline_entity:
+            line += f" vs {a.baseline_entity}"
+        line += f"  range={a.value_range} tiers={a.tiers} confidence={a.confidence}"
+        if a.flags:
+            line += f" flags={a.flags}"
+        typer.echo(line)
 
 
 if __name__ == "__main__":

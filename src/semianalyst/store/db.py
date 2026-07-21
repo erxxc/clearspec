@@ -144,14 +144,17 @@ def insert_entity(conn: sqlite3.Connection, ent: models.Entity) -> None:
 
 def insert_claim(conn: sqlite3.Connection, claim: models.Claim) -> None:
     c = claim
+    # The claim's corroboration verdict is NOT persisted (v3 / decision B2): it is a
+    # per-group fact analyze derives on read, not a property of the stored row. The
+    # store deliberately holds no corr_status column — read the AnalysisReport.
     conn.execute(
         "INSERT INTO claim"
         "(claim_id, doc_id, entity_id, claim_class, metric, value, unit, "
         " cmp_is_relative, cmp_baseline_entity, cmp_baseline_stated, "
         " cond_workload, cond_precision, cond_sparsity, cond_thermal_config, "
         " cond_stated_caveats, completeness, cite_page, cite_quote_span, "
-        " cite_location_type, corr_status, corr_related_claim_ids) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " cite_location_type) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             c.claim_id, c.doc_id, c.entity_id, _enum(c.claim_class), c.metric,
             c.value, c.unit,
@@ -161,8 +164,6 @@ def insert_claim(conn: sqlite3.Connection, claim: models.Claim) -> None:
             _b(c.conditions.sparsity), c.conditions.thermal_config,
             json.dumps(c.conditions.stated_caveats), _enum(c.completeness),
             c.citation.page, c.citation.quote_span, _enum(c.citation.location_type),
-            _enum(c.corroboration.status),
-            json.dumps(c.corroboration.related_claim_ids),
         ),
     )
 
@@ -173,6 +174,108 @@ def insert_claim(conn: sqlite3.Connection, claim: models.Claim) -> None:
 def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
     tables = ("document", "entity", "claim", "macro_snapshot")
     return {t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"] for t in tables}
+
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ClaimView:
+    """A read-only claim projection joined to its document's source_tier — exactly
+    what analyze needs, without reconstructing the full nested Claim model."""
+
+    claim_id: str
+    doc_id: str
+    entity_id: str
+    metric: str
+    value: float
+    unit: str
+    is_relative: bool
+    baseline_entity: str | None
+    sparsity: bool | None
+    completeness: str
+    source_tier: int
+
+
+# Column -> getter maps for fill-null reconciliation (COALESCE semantics).
+_NODE_COLS = {
+    "node_density_mtx_mm2": lambda n: n.density_mtx_mm2,
+    "node_transistor_type": lambda n: _enum(n.transistor_type),
+    "node_backside_power": lambda n: _b(n.backside_power),
+    "node_hvm_date_claimed": lambda n: _d(n.hvm_date_claimed),
+    "node_hvm_date_actual": lambda n: _d(n.hvm_date_actual),
+}
+_CHIP_COLS = {
+    "chip_process_node_ref": lambda c: c.process_node_ref,
+    "chip_transistor_count_b": lambda c: c.transistor_count_b,
+    "chip_die_size_mm2": lambda c: c.die_size_mm2,
+    "chip_package_type": lambda c: c.package_type,
+    "chip_memory_type": lambda c: c.memory_type,
+    "chip_memory_bw_gbps": lambda c: c.memory_bw_gbps,
+    "chip_tdp_w": lambda c: c.tdp_w,
+    "chip_launch_date": lambda c: _d(c.launch_date),
+}
+
+
+def reconcile_entity(conn: sqlite3.Connection, ent: models.Entity) -> None:
+    """Insert a new entity, or merge into an existing one: union aliases, union
+    attribute_citations, and fill NULL node/chip attributes from the newcomer —
+    but NEVER overwrite a non-null attribute (a conflict is left to the caller /
+    a future workstream). Cross-document trust (tier precedence, poisoning) is a
+    deferred Class-A decision; this is the minimal honest-data reconciler."""
+    existing = conn.execute("SELECT * FROM entity WHERE entity_id = ?", (ent.entity_id,)).fetchone()
+    if existing is None:
+        insert_entity(conn, ent)
+        return
+
+    aliases = json.loads(existing["aliases"])
+    for alias in ent.aliases:
+        if alias not in aliases:
+            aliases.append(alias)
+
+    attr_cites = json.loads(existing["attribute_citations"])
+    for path, cite in ent.attribute_citations.items():
+        attr_cites.setdefault(path, cite.model_dump(mode="json"))
+
+    node = ent.node or models.NodeAttributes()
+    chip = ent.chip or models.ChipAttributes()
+    set_cols = ["aliases = ?", "attribute_citations = ?"]
+    params: list[object] = [json.dumps(aliases), json.dumps(attr_cites)]
+    # fill NULL columns only (COALESCE keeps a non-null existing value)
+    for col, getter in list(_NODE_COLS.items()) + list(_CHIP_COLS.items()):
+        set_cols.append(f"{col} = COALESCE({col}, ?)")
+        params.append(getter(node if col.startswith("node_") else chip))
+    params.append(ent.entity_id)
+    conn.execute(f"UPDATE entity SET {', '.join(set_cols)} WHERE entity_id = ?", params)
+
+
+def get_entities_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """entity_id -> aliases, for every reconciled entity in the store."""
+    return {
+        row["entity_id"]: json.loads(row["aliases"])
+        for row in conn.execute("SELECT entity_id, aliases FROM entity")
+    }
+
+
+def get_claims_for_analysis(conn: sqlite3.Connection) -> list[ClaimView]:
+    """Every claim, joined to its document's source_tier."""
+    rows = conn.execute(
+        "SELECT c.claim_id, c.doc_id, c.entity_id, c.metric, c.value, c.unit, "
+        "       c.cmp_is_relative, c.cmp_baseline_entity, c.cond_sparsity, "
+        "       c.completeness, d.source_tier "
+        "FROM claim c JOIN document d ON c.doc_id = d.doc_id"
+    ).fetchall()
+    return [
+        ClaimView(
+            claim_id=r["claim_id"], doc_id=r["doc_id"], entity_id=r["entity_id"],
+            metric=r["metric"], value=r["value"], unit=r["unit"],
+            is_relative=bool(r["cmp_is_relative"]),
+            baseline_entity=r["cmp_baseline_entity"],
+            sparsity=None if r["cond_sparsity"] is None else bool(r["cond_sparsity"]),
+            completeness=r["completeness"], source_tier=int(r["source_tier"]),
+        )
+        for r in rows
+    ]
 
 
 def report_counts(config: Config | None = None) -> dict[str, int]:

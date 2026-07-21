@@ -1,0 +1,40 @@
+{
+  "_note": "Source 1 of 3 — TSMC foundry PR (tier 2). Post-extraction ExtractionResult + its Document, loaded into the store for the analyze MVP test. Claims are doc-scoped (claim_id = doc_id:metric).",
+  "document": {
+    "doc_id": "tsmc_pr_n2", "title": "TSMC N2 Enters Volume Production",
+    "publisher": "TSMC", "doc_type": "foundry_announcement", "source_tier": 2,
+    "publish_date": "2025-12-01", "url": "https://pr.tsmc.example/n2",
+    "file_sha256": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "ingest_date": "2026-01-05"
+  },
+  "entities": [
+    {"entity_id": "tsmc_n2", "entity_type": "process_node", "vendor": "TSMC", "name": "N2", "aliases": ["N2"]},
+    {"entity_id": "tsmc_n3e", "entity_type": "process_node", "vendor": "TSMC", "name": "N3E", "aliases": ["N3E"]}
+  ],
+  "claims": [
+    {"claim_id": "tsmc_pr_n2:logic_speed", "doc_id": "tsmc_pr_n2", "entity_id": "tsmc_n2",
+     "claim_class": "performance", "metric": "logic_speed", "value": 1.15, "unit": "x",
+     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
+     "conditions": {"stated_caveats": ["at iso-power"]},
+     "completeness": "complete",
+     "citation": {"page": 1, "quote_span": "N2 delivers 1.15x logic speed at iso-power versus N3E.", "location_type": "unknown"}},
+    {"claim_id": "tsmc_pr_n2:perf_per_watt", "doc_id": "tsmc_pr_n2", "entity_id": "tsmc_n2",
+     "claim_class": "efficiency", "metric": "perf_per_watt", "value": 1.3, "unit": "x",
+     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
+     "conditions": {"stated_caveats": ["at iso-power"]},
+     "completeness": "complete",
+     "citation": {"page": 1, "quote_span": "N2 improves performance-per-watt 1.3x at iso-power versus N3E.", "location_type": "unknown"}},
+    {"claim_id": "tsmc_pr_n2:sram_density", "doc_id": "tsmc_pr_n2", "entity_id": "tsmc_n2",
+     "claim_class": "density", "metric": "sram_density", "value": 1.2, "unit": "x",
+     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
+     "conditions": {"stated_caveats": []},
+     "completeness": "complete",
+     "citation": {"page": 2, "quote_span": "SRAM bit-cell density improves 1.2x over N3E.", "location_type": "unknown"}},
+    {"claim_id": "tsmc_pr_n2:yield_rate", "doc_id": "tsmc_pr_n2", "entity_id": "tsmc_n2",
+     "claim_class": "yield", "metric": "yield_rate", "value": 65.0, "unit": "%",
+     "comparison": {"is_relative": false, "baseline_entity": null, "baseline_stated": false},
+     "conditions": {"stated_caveats": []},
+     "completeness": "complete",
+     "citation": {"page": 2, "quote_span": "Defect density supports a 65% D0 yield at risk production.", "location_type": "unknown"}}
+  ]
+}

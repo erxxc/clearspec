@@ -7,10 +7,14 @@ reverse once data and prompts accumulate.
 The schema defines every structure; pydantic models (`store/models.py`) and the
 SQLite DDL (`store/migrations/`) are both derived from it. Change the schema
 first; regenerate the models and add a migration — never the other way around.
-**`schema/extraction_schema_v2.yaml` is current** (extraction targets v2);
-`_v1.yaml` is retained unedited. v2 added per-attribute grounding for entity
-attributes (`entity.attribute_citations`) and a fail-safe `unknown` value on
-`citation.location_type`.
+**`schema/extraction_schema_v3.yaml` is current**; `_v1`/`_v2` are retained
+unedited. v2 added per-attribute grounding (`entity.attribute_citations`) and a
+fail-safe `unknown` `citation.location_type`; v3 added `weakly_corroborated` as a
+`corroboration.status` verdict value (a group that agrees within tolerance but has
+<2 non-suspect members — a clean number + an honestly-disclosed sparsity number)
+and made corroboration **derive-on-read, not persisted** — migration 0003 dropped
+the per-row `corr_status`/`corr_related_claim_ids` columns (a per-group verdict has
+no honest per-row home) and dropped the `cmp_baseline_entity` FK.
 
 ## The claim is the atomic unit — and its integrity rules are non-negotiable
 - **Every extracted value cites a source span** — code-enforced, not trusted to
@@ -44,15 +48,51 @@ ever interpolated into SQL text. Schema changes ship as new numbered migrations
 live on the filesystem under `data/raw/`, content-addressed — that is ingest's
 concern, not the database's.)
 
-**Cross-document entity reconciliation is an open PREREQUISITE for persistence.**
-The inserts use plain `INSERT` (a duplicate primary key **raises**, not silently
-overwrites) — because `entity_id`/`claim_id` are model-derived and shared across
-documents, so a naive `INSERT OR REPLACE` would let a later (or hostile) document
-clobber an entity an earlier document created, destroying corroboration. Do NOT
-wire `run_extract` → `insert_*` until the persistence workstream defines how a
-second document naming an existing entity is merged/versioned. `validate.py`
-enforces a per-DOCUMENT trust boundary only (a claim must reference an entity from
-its own proposal); cross-document trust is the store workstream's job.
+**Persistence + reconciliation (`store.persist_extraction`).** Inserts a document
+(plain `INSERT`, fail-loud on a duplicate `doc_id`), reconciles each entity
+(`reconcile_entity`: union aliases, fill NULL node/chip attributes, **never**
+overwrite a non-null one), and inserts claims under a doc-scoped `claim_id`
+(`{doc_id}:{id}`) so two docs' claims coexist. `cmp_baseline_entity` has no FK (a
+baseline may be cross-document or dangling; analyze flags `unresolved_baseline`).
+There is **no persisted per-row corroboration verdict** — migration 0003 dropped
+the `corr_status`/`corr_related_claim_ids` columns. Corroboration is a per-GROUP
+fact analyze recomputes *derive-on-read* over the whole store on every `report`;
+the `AnalysisReport` is the sole source of truth. The `Claim` model keeps a
+`corroboration` field with a neutral default for extraction-output shape stability,
+but `insert_claim` never writes it and nothing reads it back. Do not re-add a
+persisted per-row verdict without settling the per-group-fact-in-a-per-row-home
+question (decision B2, analyze GATE-2 resolution).
+
+**Hostile-input trust is DEFERRED to the live-ingest workstream (Class A).** The
+current slice runs on curated fixtures — no hostile document can reach
+`persist_extraction`. When live ingest lands, these decisions must be made and
+enforced with a *named adversarial suite* (never the honest acceptance golden):
+- **K** — does a strictly-higher-trust document ever override a non-null attribute,
+  or only race a null one? (current: first-non-null-wins, tier-blind.) This also
+  governs `favored_tier`: it currently ships **tier-blind** (`min` over *all*
+  contradiction members, suspects included) — a sparsity flag does NOT override the
+  tier ordering. Whether a suspect member should be excluded (letting sparsity
+  demote a tier) is part of K, unbuilt.
+- **G** — alias-union gating (a tier-3 doc can currently inject any alias string).
+- **H** — a **status-level** tier-diversity floor for `corroborated` (stop tier-3
+  flooding; the MVP has no floor, one doc per tier).
+- **Resolved-baseline poisoning** — a hostile doc setting `baseline_entity` to a
+  real, already-stored competitor entity (unvalidated; P2 only flags *dangling*).
+- **Identity-field conflict** — on entity merge, `reconcile_entity` unions
+  aliases/attribute_citations and fills nulls, but `vendor`/`name`/`entity_type`
+  are frozen by the *first* document; a later document's differing values are
+  dropped with no signal. A typo'd vendor silently conflates two real things under
+  one `entity_id`. No conflict detection built.
+- **Baseline content-bound** — post-0003 `cmp_baseline_entity` is unconstrained
+  TEXT (the FK drop removed the shape guard too, not just the existence guard). No
+  length/byte-content bound on it or on free-text `metric`.
+- **Report display safety** — `cli.py:report()` echoes DB-derived strings
+  (`entity_id`, `aliases`, `metric`, `baseline_entity`) to the terminal with **no
+  output encoding**. Honest fixtures are inert, but once live extraction feeds
+  proposal content here, ANSI/OSC escape sequences render on `semianalyst report`
+  with no code change on the display side. Sanitize output before this ships live.
+- **I/J** — persisted conflict records; slug-collision detection strength.
+`validate.py` enforces a per-DOCUMENT boundary only; cross-document trust is Class A.
 
 ## Prompts and the schema are versioned artifacts, not edited in place
 A prompt change means a NEW file (`extract_foundry_v2.md`), so every extraction
@@ -73,8 +113,10 @@ gitignored in full.
 ## Module map
 - `ingest/`  — fetchers + content-addressed raw storage (network fetch: WIP)
 - `extract/` — raw doc → schema records via a versioned prompt (LLM: WIP/stub)
-- `store/`   — SQLite persistence; sole DB owner
-- `analyze/` — cross-source corroboration + divergence (future work)
+- `store/`   — SQLite persistence + entity reconciliation; sole DB owner
+- `analyze/` — cross-source corroboration + divergence (v1: tolerance grouping,
+  suspect members excluded from the corroborated count, tier-blind `favored_tier`
+  on contradictions; derive-on-read, read-only over `store`)
 - `cli.py`   — thin argument layer over the above
 
 ## Testing (ENFORCE posture)

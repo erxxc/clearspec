@@ -1,0 +1,1028 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index d94546e..c89758d 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -7,10 +7,11 @@ reverse once data and prompts accumulate.
+ The schema defines every structure; pydantic models (`store/models.py`) and the
+ SQLite DDL (`store/migrations/`) are both derived from it. Change the schema
+ first; regenerate the models and add a migration — never the other way around.
+-**`schema/extraction_schema_v2.yaml` is current** (extraction targets v2);
+-`_v1.yaml` is retained unedited. v2 added per-attribute grounding for entity
+-attributes (`entity.attribute_citations`) and a fail-safe `unknown` value on
+-`citation.location_type`.
++**`schema/extraction_schema_v3.yaml` is current**; `_v1`/`_v2` are retained
++unedited. v2 added per-attribute grounding (`entity.attribute_citations`) and a
++fail-safe `unknown` `citation.location_type`; v3 added `weakly_corroborated` to
++`corroboration.status` (a group that agrees within tolerance but has <2 non-suspect
++members — a clean number + an honestly-disclosed sparsity number).
+ 
+ ## The claim is the atomic unit — and its integrity rules are non-negotiable
+ - **Every extracted value cites a source span** — code-enforced, not trusted to
+@@ -44,15 +45,26 @@ ever interpolated into SQL text. Schema changes ship as new numbered migrations
+ live on the filesystem under `data/raw/`, content-addressed — that is ingest's
+ concern, not the database's.)
+ 
+-**Cross-document entity reconciliation is an open PREREQUISITE for persistence.**
+-The inserts use plain `INSERT` (a duplicate primary key **raises**, not silently
+-overwrites) — because `entity_id`/`claim_id` are model-derived and shared across
+-documents, so a naive `INSERT OR REPLACE` would let a later (or hostile) document
+-clobber an entity an earlier document created, destroying corroboration. Do NOT
+-wire `run_extract` → `insert_*` until the persistence workstream defines how a
+-second document naming an existing entity is merged/versioned. `validate.py`
+-enforces a per-DOCUMENT trust boundary only (a claim must reference an entity from
+-its own proposal); cross-document trust is the store workstream's job.
++**Persistence + reconciliation (`store.persist_extraction`).** Inserts a document
++(plain `INSERT`, fail-loud on a duplicate `doc_id`), reconciles each entity
++(`reconcile_entity`: union aliases, fill NULL node/chip attributes, **never**
++overwrite a non-null one), and inserts claims under a doc-scoped `claim_id`
++(`{doc_id}:{id}`) so two docs' claims coexist. `cmp_baseline_entity` has no FK (a
++baseline may be cross-document or dangling; analyze flags `unresolved_baseline`).
++
++**Hostile-input trust is DEFERRED to the live-ingest workstream (Class A).** The
++current slice runs on curated fixtures — no hostile document can reach
++`persist_extraction`. When live ingest lands, these decisions must be made and
++enforced with a *named adversarial suite* (never the honest acceptance golden):
++- **K** — does a strictly-higher-trust document ever override a non-null attribute,
++  or only race a null one? (current: first-non-null-wins, tier-blind.)
++- **G** — alias-union gating (a tier-3 doc can currently inject any alias string).
++- **H** — a **status-level** tier-diversity floor for `corroborated` (stop tier-3
++  flooding; the MVP has no floor, one doc per tier).
++- **Resolved-baseline poisoning** — a hostile doc setting `baseline_entity` to a
++  real, already-stored competitor entity (unvalidated; P2 only flags *dangling*).
++- **I/J** — persisted conflict records; slug-collision detection strength.
++`validate.py` enforces a per-DOCUMENT boundary only; cross-document trust is Class A.
+ 
+ ## Prompts and the schema are versioned artifacts, not edited in place
+ A prompt change means a NEW file (`extract_foundry_v2.md`), so every extraction
+@@ -73,8 +85,9 @@ gitignored in full.
+ ## Module map
+ - `ingest/`  — fetchers + content-addressed raw storage (network fetch: WIP)
+ - `extract/` — raw doc → schema records via a versioned prompt (LLM: WIP/stub)
+-- `store/`   — SQLite persistence; sole DB owner
+-- `analyze/` — cross-source corroboration + divergence (future work)
++- `store/`   — SQLite persistence + entity reconciliation; sole DB owner
++- `analyze/` — cross-source corroboration + divergence (v1: tolerance grouping,
++  suspect-exclusion, tier-weighting; derive-on-read, read-only over `store`)
+ - `cli.py`   — thin argument layer over the above
+ 
+ ## Testing (ENFORCE posture)
+diff --git a/schema/extraction_schema_v3.yaml b/schema/extraction_schema_v3.yaml
+new file mode 100644
+index 0000000..7966ca9
+--- /dev/null
++++ b/schema/extraction_schema_v3.yaml
+@@ -0,0 +1,31 @@
++# Semiconductor Technical Release — Extraction Schema v3
++# Supersedes v2 (schema/extraction_schema_v2.yaml), which is retained unedited.
++#
++# What changed from v2 (analyze GATE-1 v2 resolution, 2026-07-20):
++#   * corroboration.status gains `weakly_corroborated` (NEW). A group of >=2
++#     claims that AGREE within tolerance but has fewer than 2 NON-SUSPECT members
++#     (e.g. a foundry's clean number + a vendor deck that honestly discloses
++#     sparsity) is not `corroborated` (a suspect number must not validate a clean
++#     one) yet is not `contradicted` (they agree) nor a singleton — the v2 3-value
++#     enum had no slot for this common, honest pattern.
++#
++# Everything else is identical to v2 (entity.attribute_citations, the `unknown`
++# location_type, per-attribute grounding, all other blocks). Only the changed
++# block is shown in full below; see extraction_schema_v2.yaml for the rest.
++
++# ---------------------------------------------------------------
++# CLAIM.corroboration — the divergence/agreement verdict (v3 enum)
++# ---------------------------------------------------------------
++claim:
++  # ... doc_id/entity_id/claim_class/metric/value/unit/comparison/conditions/
++  #     completeness/citation identical to v2 ...
++  corroboration:
++    status: enum              # [uncorroborated, corroborated,
++                              #  weakly_corroborated, contradicted]
++                              #  weakly_corroborated (v3): >=2 members agree within
++                              #  tolerance but <2 are non-suspect (sparsity /
++                              #  marketing_only rode along) — a hedged agreement.
++    related_claim_ids: [ref]  # the other members of this claim's group
++
++# All other blocks (document, citation, entity, macro_snapshot, normalization
++# rules) are unchanged from extraction_schema_v2.yaml.
+diff --git a/src/semianalyst/analyze/__init__.py b/src/semianalyst/analyze/__init__.py
+index ef0230c..426e1cc 100644
+--- a/src/semianalyst/analyze/__init__.py
++++ b/src/semianalyst/analyze/__init__.py
+@@ -20,3 +20,12 @@ questions that make this an analyst tool rather than a scraper:
+ Design constraint: analysis is read-only over the store and must preserve the
+ schema's normalization rules (no relative->absolute conversion).
+ """
++
++from .corroborate import (
++    Assessment,
++    AnalysisReport,
++    analyze_claims,
++    run_analysis,
++)
++
++__all__ = ["Assessment", "AnalysisReport", "analyze_claims", "run_analysis"]
+diff --git a/src/semianalyst/analyze/corroborate.py b/src/semianalyst/analyze/corroborate.py
+new file mode 100644
+index 0000000..ebe27a1
+--- /dev/null
++++ b/src/semianalyst/analyze/corroborate.py
+@@ -0,0 +1,144 @@
++"""analyze v1 — cross-source corroboration and divergence.
++
++Reads claims (joined to their document's source_tier) from the store, groups them
++by (entity, metric, is_relative, baseline, unit), and assigns each group a
++corroboration verdict. Read-only over the store; derives on read (does not mutate
++`claim.corroboration` this iteration).
++
++Verdict rules (honest-data domain):
++  - Compare only within a shared (metric, is_relative, baseline, unit) — a relative
++    claim never compares against an absolute one, nor across baselines.
++  - A SUSPECT member (sparsity=true or completeness=marketing_only) may ride along
++    but does NOT count toward the >=2 needed for `corroborated`.
++  - status: singleton -> uncorroborated; spread beyond tolerance -> contradicted;
++    >=2 non-suspect within tolerance -> corroborated; else (>=2 members agree but
++    <2 non-suspect) -> weakly_corroborated.
++  - flags surface sparsity / marketing_only / unresolved_baseline / single_source.
++
++Hostile-input guards (tier-precedence, tier-diversity status floor, resolved-entity
++baseline poisoning, alias gating) are Class-A decisions deferred to the live-ingest
++workstream — no hostile document can reach this MVP's curated inputs. See CLAUDE.md.
++"""
++
++from __future__ import annotations
++
++from collections import defaultdict
++from dataclasses import dataclass
++
++from ..config import Config, load_config
++from ..store import ClaimView, connect, get_claims_for_analysis, get_entities_index
++
++TOLERANCE_PCT = 10.0
++
++_CONFIDENCE = {
++    "corroborated": "high",
++    "weakly_corroborated": "medium",
++    "contradicted": "low",
++    "uncorroborated": "none",
++}
++
++
++@dataclass
++class Assessment:
++    entity_id: str
++    metric: str
++    baseline_entity: str | None
++    status: str
++    members: list[str]
++    value_range: list[float]
++    spread_pct: float
++    tiers: list[int]
++    confidence: str
++    flags: list[str]
++    favored_tier: int | None = None
++
++    def to_dict(self) -> dict:
++        d = {
++            "entity_id": self.entity_id, "metric": self.metric,
++            "baseline_entity": self.baseline_entity, "status": self.status,
++            "members": self.members, "value_range": self.value_range,
++            "spread_pct": self.spread_pct, "tiers": self.tiers,
++            "confidence": self.confidence, "flags": self.flags,
++        }
++        if self.favored_tier is not None:
++            d["favored_tier"] = self.favored_tier
++        return d
++
++
++@dataclass
++class AnalysisReport:
++    entities_reconciled: dict[str, dict]
++    assessments: list[Assessment]
++
++    def to_dict(self) -> dict:
++        return {
++            "entities_reconciled": self.entities_reconciled,
++            "assessments": [a.to_dict() for a in self.assessments],
++        }
++
++
++def _suspect(claim: ClaimView) -> bool:
++    return claim.sparsity is True or claim.completeness == "marketing_only"
++
++
++def _assess(group: list[ClaimView], entity_ids: set[str]) -> Assessment:
++    members = sorted(group, key=lambda c: c.claim_id)
++    values = [c.value for c in members]
++    lo, hi = min(values), max(values)
++    spread = round((hi - lo) / lo * 100, 1) if lo else 0.0
++    tiers = sorted({c.source_tier for c in members})
++    non_suspect = [c for c in members if not _suspect(c)]
++    baseline = members[0].baseline_entity
++
++    flags: list[str] = []
++    if any(c.sparsity is True for c in members):
++        flags.append("sparsity")
++    if any(c.completeness == "marketing_only" for c in members):
++        flags.append("marketing_only")
++    if baseline is not None and baseline not in entity_ids:
++        flags.append("unresolved_baseline")
++    if len(members) == 1:
++        flags.append("single_source")
++
++    if len(members) == 1:
++        status = "uncorroborated"
++    elif spread > TOLERANCE_PCT:
++        status = "contradicted"
++    elif len(non_suspect) >= 2:
++        status = "corroborated"
++    else:
++        status = "weakly_corroborated"
++
++    favored_tier = None
++    if status == "contradicted":
++        favored_tier = min(c.source_tier for c in (non_suspect or members))
++
++    return Assessment(
++        entity_id=members[0].entity_id, metric=members[0].metric, baseline_entity=baseline,
++        status=status, members=[c.claim_id for c in members],
++        value_range=[lo, hi], spread_pct=spread, tiers=tiers,
++        confidence=_CONFIDENCE[status], flags=sorted(flags), favored_tier=favored_tier,
++    )
++
++
++def analyze_claims(claims: list[ClaimView], entities_index: dict[str, list[str]]) -> AnalysisReport:
++    entity_ids = set(entities_index)
++    groups: dict[tuple, list[ClaimView]] = defaultdict(list)
++    for claim in claims:
++        groups[(claim.entity_id, claim.metric, claim.is_relative,
++                claim.baseline_entity, claim.unit)].append(claim)
++
++    assessments = [_assess(g, entity_ids) for g in groups.values()]
++    assessments.sort(key=lambda a: (a.entity_id, a.metric, a.baseline_entity or ""))
++    reconciled = {eid: {"aliases": sorted(aliases)} for eid, aliases in entities_index.items()}
++    return AnalysisReport(entities_reconciled=reconciled, assessments=assessments)
++
++
++def run_analysis(config: Config | None = None) -> AnalysisReport:
++    """Library entry point behind `semianalyst report`. Read-only over the store."""
++    config = config or load_config()
++    conn = connect(config.paths.db_path)
++    try:
++        return analyze_claims(get_claims_for_analysis(conn), get_entities_index(conn))
++    finally:
++        conn.close()
+diff --git a/src/semianalyst/cli.py b/src/semianalyst/cli.py
+index 9ab174e..93022cd 100644
+--- a/src/semianalyst/cli.py
++++ b/src/semianalyst/cli.py
+@@ -12,6 +12,7 @@ from __future__ import annotations
+ import typer
+ 
+ from . import store
++from .analyze import run_analysis
+ from .config import load_config
+ from .extract.pipeline import run_extract
+ from .ingest.pipeline import run_ingest
+@@ -59,9 +60,21 @@ def extract() -> None:
+ 
+ @app.command()
+ def report() -> None:
+-    """Print a summary of stored documents, entities, and claims."""
+-    for table, count in store.report_counts(load_config()).items():
+-        typer.echo(f"{table}: {count}")
++    """Print cross-source corroboration and divergence per entity + metric."""
++    analysis = run_analysis(load_config())
++    if not analysis.assessments:
++        typer.echo("no claims in the store — nothing to corroborate yet.")
++        return
++    for entity_id, info in analysis.entities_reconciled.items():
++        typer.echo(f"{entity_id}  aliases={info['aliases']}")
++    for a in analysis.assessments:
++        line = f"  [{a.status}] {a.metric}"
++        if a.baseline_entity:
++            line += f" vs {a.baseline_entity}"
++        line += f"  range={a.value_range} tiers={a.tiers} confidence={a.confidence}"
++        if a.flags:
++            line += f" flags={a.flags}"
++        typer.echo(line)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/semianalyst/extract/validate.py b/src/semianalyst/extract/validate.py
+index 3177948..d70ec11 100644
+--- a/src/semianalyst/extract/validate.py
++++ b/src/semianalyst/extract/validate.py
+@@ -259,12 +259,19 @@ def validate_proposal(
+         if (claim.comparison.is_relative and claim.comparison.baseline_entity is None
+                 and claim.completeness == models.Completeness.complete):
+             claim.completeness = models.Completeness.missing_baseline
+-        # marketing_only: sparsity + cross-vendor comparison.
++        # marketing_only: sparsity + a genuine CROSS-VENDOR (competitor) comparison.
++        # BOTH vendors must be known — an unresolved (None) baseline vendor is NOT
++        # treated as "different vendor" (that misfired on same-vendor claims whose
++        # baseline wasn't in the proposal, e.g. a vendor slide citing N2-vs-N3E
++        # without declaring N3E). Sparsity suspicion for same-vendor comparisons is
++        # an analyze-layer signal, not a completeness label.
++        entity_vendor = vendor_of.get(claim.entity_id)
++        baseline_vendor = vendor_of.get(claim.comparison.baseline_entity)
+         if (claim.conditions.sparsity is True
+                 and claim.comparison.is_relative
+-                and claim.comparison.baseline_entity is not None
+-                and vendor_of.get(claim.entity_id)
+-                != vendor_of.get(claim.comparison.baseline_entity)):
++                and entity_vendor is not None
++                and baseline_vendor is not None
++                and entity_vendor != baseline_vendor):
+             claim.completeness = models.Completeness.marketing_only
+         _force_unknown(claim.citation)
+         kept_claims.append(claim)
+diff --git a/src/semianalyst/store/__init__.py b/src/semianalyst/store/__init__.py
+index c4b01ad..20a584d 100644
+--- a/src/semianalyst/store/__init__.py
++++ b/src/semianalyst/store/__init__.py
+@@ -6,22 +6,32 @@ No other package should import `sqlite3` or write SQL.
+ 
+ from . import models
+ from .db import (
++    ClaimView,
+     connect,
++    get_claims_for_analysis,
++    get_entities_index,
+     init_db,
+     insert_claim,
+     insert_document,
+     insert_entity,
++    reconcile_entity,
+     report_counts,
+     table_counts,
+ )
++from .persist import persist_extraction
+ 
+ __all__ = [
+     "models",
++    "ClaimView",
+     "connect",
++    "get_claims_for_analysis",
++    "get_entities_index",
+     "init_db",
+     "insert_claim",
+     "insert_document",
+     "insert_entity",
++    "reconcile_entity",
++    "persist_extraction",
+     "report_counts",
+     "table_counts",
+ ]
+diff --git a/src/semianalyst/store/db.py b/src/semianalyst/store/db.py
+index 7b27632..b5eb7e8 100644
+--- a/src/semianalyst/store/db.py
++++ b/src/semianalyst/store/db.py
+@@ -175,6 +175,108 @@ def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
+     return {t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"] for t in tables}
+ 
+ 
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class ClaimView:
++    """A read-only claim projection joined to its document's source_tier — exactly
++    what analyze needs, without reconstructing the full nested Claim model."""
++
++    claim_id: str
++    doc_id: str
++    entity_id: str
++    metric: str
++    value: float
++    unit: str
++    is_relative: bool
++    baseline_entity: str | None
++    sparsity: bool | None
++    completeness: str
++    source_tier: int
++
++
++# Column -> getter maps for fill-null reconciliation (COALESCE semantics).
++_NODE_COLS = {
++    "node_density_mtx_mm2": lambda n: n.density_mtx_mm2,
++    "node_transistor_type": lambda n: _enum(n.transistor_type),
++    "node_backside_power": lambda n: _b(n.backside_power),
++    "node_hvm_date_claimed": lambda n: _d(n.hvm_date_claimed),
++    "node_hvm_date_actual": lambda n: _d(n.hvm_date_actual),
++}
++_CHIP_COLS = {
++    "chip_process_node_ref": lambda c: c.process_node_ref,
++    "chip_transistor_count_b": lambda c: c.transistor_count_b,
++    "chip_die_size_mm2": lambda c: c.die_size_mm2,
++    "chip_package_type": lambda c: c.package_type,
++    "chip_memory_type": lambda c: c.memory_type,
++    "chip_memory_bw_gbps": lambda c: c.memory_bw_gbps,
++    "chip_tdp_w": lambda c: c.tdp_w,
++    "chip_launch_date": lambda c: _d(c.launch_date),
++}
++
++
++def reconcile_entity(conn: sqlite3.Connection, ent: models.Entity) -> None:
++    """Insert a new entity, or merge into an existing one: union aliases, union
++    attribute_citations, and fill NULL node/chip attributes from the newcomer —
++    but NEVER overwrite a non-null attribute (a conflict is left to the caller /
++    a future workstream). Cross-document trust (tier precedence, poisoning) is a
++    deferred Class-A decision; this is the minimal honest-data reconciler."""
++    existing = conn.execute("SELECT * FROM entity WHERE entity_id = ?", (ent.entity_id,)).fetchone()
++    if existing is None:
++        insert_entity(conn, ent)
++        return
++
++    aliases = json.loads(existing["aliases"])
++    for alias in ent.aliases:
++        if alias not in aliases:
++            aliases.append(alias)
++
++    attr_cites = json.loads(existing["attribute_citations"])
++    for path, cite in ent.attribute_citations.items():
++        attr_cites.setdefault(path, cite.model_dump(mode="json"))
++
++    node = ent.node or models.NodeAttributes()
++    chip = ent.chip or models.ChipAttributes()
++    set_cols = ["aliases = ?", "attribute_citations = ?"]
++    params: list[object] = [json.dumps(aliases), json.dumps(attr_cites)]
++    # fill NULL columns only (COALESCE keeps a non-null existing value)
++    for col, getter in list(_NODE_COLS.items()) + list(_CHIP_COLS.items()):
++        set_cols.append(f"{col} = COALESCE({col}, ?)")
++        params.append(getter(node if col.startswith("node_") else chip))
++    params.append(ent.entity_id)
++    conn.execute(f"UPDATE entity SET {', '.join(set_cols)} WHERE entity_id = ?", params)
++
++
++def get_entities_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
++    """entity_id -> aliases, for every reconciled entity in the store."""
++    return {
++        row["entity_id"]: json.loads(row["aliases"])
++        for row in conn.execute("SELECT entity_id, aliases FROM entity")
++    }
++
++
++def get_claims_for_analysis(conn: sqlite3.Connection) -> list[ClaimView]:
++    """Every claim, joined to its document's source_tier."""
++    rows = conn.execute(
++        "SELECT c.claim_id, c.doc_id, c.entity_id, c.metric, c.value, c.unit, "
++        "       c.cmp_is_relative, c.cmp_baseline_entity, c.cond_sparsity, "
++        "       c.completeness, d.source_tier "
++        "FROM claim c JOIN document d ON c.doc_id = d.doc_id"
++    ).fetchall()
++    return [
++        ClaimView(
++            claim_id=r["claim_id"], doc_id=r["doc_id"], entity_id=r["entity_id"],
++            metric=r["metric"], value=r["value"], unit=r["unit"],
++            is_relative=bool(r["cmp_is_relative"]),
++            baseline_entity=r["cmp_baseline_entity"],
++            sparsity=None if r["cond_sparsity"] is None else bool(r["cond_sparsity"]),
++            completeness=r["completeness"], source_tier=int(r["source_tier"]),
++        )
++        for r in rows
++    ]
++
++
+ def report_counts(config: Config | None = None) -> dict[str, int]:
+     """Row counts per table. The library entry point behind `semianalyst report`
+     (and a future web UI) — callers never open a connection themselves."""
+diff --git a/src/semianalyst/store/migrations/0003_weakly_corroborated.sql b/src/semianalyst/store/migrations/0003_weakly_corroborated.sql
+new file mode 100644
+index 0000000..b2a452b
+--- /dev/null
++++ b/src/semianalyst/store/migrations/0003_weakly_corroborated.sql
+@@ -0,0 +1,49 @@
++-- 0003 — v3 schema (schema/extraction_schema_v3.yaml). Append-only: do NOT edit 0001/0002.
++--
++-- (1) Adds 'weakly_corroborated' to claim.corr_status.
++-- (2) DROPS the foreign key on cmp_baseline_entity. A baseline can be a
++--     cross-document reference an earlier doc introduced, or a dangling one
++--     (a competitor node never ingested) — per P2 the claim is KEPT and analyze
++--     flags `unresolved_baseline`, so the reference must NOT be FK-enforced.
++--     (entity_id keeps its FK — a claim's own subject must be a stored entity.)
++-- SQLite can't alter a CHECK/FK in place, so recreate the claim table (nothing
++-- references claim by foreign key). Kept for schema fidelity + a future
++-- write-back path; analyze derives on read this iteration.
++
++CREATE TABLE claim_v3 (
++    claim_id              TEXT PRIMARY KEY,
++    doc_id                TEXT NOT NULL REFERENCES document(doc_id),
++    entity_id             TEXT NOT NULL REFERENCES entity(entity_id),
++    claim_class           TEXT NOT NULL CHECK (claim_class IN
++                            ('performance','efficiency','density','power',
++                             'yield','cost','availability')),
++    metric                TEXT NOT NULL,
++    value                 REAL NOT NULL,
++    unit                  TEXT NOT NULL,
++    cmp_is_relative       INTEGER NOT NULL DEFAULT 0,
++    cmp_baseline_entity   TEXT,   -- no FK: cross-doc / dangling baselines allowed (P2)
++    cmp_baseline_stated   INTEGER NOT NULL DEFAULT 0,
++    cond_workload         TEXT,
++    cond_precision        TEXT,
++    cond_sparsity         INTEGER,
++    cond_thermal_config   TEXT,
++    cond_stated_caveats   TEXT NOT NULL DEFAULT '[]',
++    completeness          TEXT NOT NULL CHECK (completeness IN
++                            ('complete','missing_baseline',
++                             'missing_conditions','marketing_only')),
++    cite_page             INTEGER,
++    cite_quote_span       TEXT NOT NULL,
++    cite_location_type    TEXT NOT NULL CHECK (cite_location_type IN
++                            ('body','table','figure','footnote','unknown')),
++    corr_status           TEXT NOT NULL DEFAULT 'uncorroborated' CHECK (corr_status IN
++                            ('uncorroborated','corroborated','weakly_corroborated','contradicted')),
++    corr_related_claim_ids TEXT NOT NULL DEFAULT '[]'
++);
++
++INSERT INTO claim_v3 SELECT * FROM claim;
++DROP TABLE claim;
++ALTER TABLE claim_v3 RENAME TO claim;
++
++CREATE INDEX IF NOT EXISTS idx_claim_doc    ON claim(doc_id);
++CREATE INDEX IF NOT EXISTS idx_claim_entity ON claim(entity_id);
++CREATE INDEX IF NOT EXISTS idx_claim_class  ON claim(claim_class);
+diff --git a/src/semianalyst/store/models.py b/src/semianalyst/store/models.py
+index 77cfb2d..e58f045 100644
+--- a/src/semianalyst/store/models.py
++++ b/src/semianalyst/store/models.py
+@@ -86,6 +86,7 @@ class LocationType(str, enum.Enum):
+ class CorroborationStatus(str, enum.Enum):
+     uncorroborated = "uncorroborated"
+     corroborated = "corroborated"
++    weakly_corroborated = "weakly_corroborated"  # v3: >=2 agree within tolerance, <2 non-suspect
+     contradicted = "contradicted"
+ 
+ 
+diff --git a/src/semianalyst/store/persist.py b/src/semianalyst/store/persist.py
+new file mode 100644
+index 0000000..f5f2319
+--- /dev/null
++++ b/src/semianalyst/store/persist.py
+@@ -0,0 +1,41 @@
++"""Persist a document's extraction into the store, with entity reconciliation.
++
++`persist_extraction` is the write-path the future ingest->extract pipeline will
++call. It inserts the document (fail-loud on a duplicate doc_id), reconciles each
++entity into the store (alias-union + fill-null; see db.reconcile_entity), and
++inserts each claim under a document-scoped claim_id so two documents' claims about
++the same entity+metric don't collide.
++
++Cross-document TRUST (tier precedence, hostile-first writes, alias gating,
++baseline poisoning of a real entity) is deliberately NOT enforced here — those are
++Class-A hostile-input decisions (K/G/H/I/J + resolved-baseline) deferred to the
++live-ingest workstream, since no hostile document can reach this path in the
++curated-fixture MVP. See CLAUDE.md.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++
++from . import models
++from .db import insert_claim, insert_document, reconcile_entity
++
++
++def _scope(doc_id: str, claim_id: str) -> str:
++    """Document-scope a claim_id; idempotent if already scoped."""
++    prefix = f"{doc_id}:"
++    return claim_id if claim_id.startswith(prefix) else prefix + claim_id
++
++
++def persist_extraction(
++    conn: sqlite3.Connection,
++    document: models.Document,
++    entities: list[models.Entity],
++    claims: list[models.Claim],
++) -> None:
++    insert_document(conn, document)  # fail-loud on duplicate doc_id
++    for entity in entities:
++        reconcile_entity(conn, entity)
++    for claim in claims:
++        scoped = claim.model_copy(update={"claim_id": _scope(document.doc_id, claim.claim_id)})
++        insert_claim(conn, scoped)
+diff --git a/tests/fixtures/analyze/tsmc_n2_corroboration/expected_analysis.json b/tests/fixtures/analyze/tsmc_n2_corroboration/expected_analysis.json
+new file mode 100644
+index 0000000..30329b5
+--- /dev/null
++++ b/tests/fixtures/analyze/tsmc_n2_corroboration/expected_analysis.json
+@@ -0,0 +1,48 @@
++{
++  "_note": "MVP acceptance verdict for analyze v1 (schema v3). Load the 3 sources -> persist with reconciliation -> run_analysis -> this (== AnalysisReport.to_dict()). Demonstrates the value on HONEST data: logic_speed corroborated (tier 1+2), perf_per_watt contradicted (foundry iso 1.3x vs vendor sparsity 1.8x, favored tier 2), sram_density WEAKLY corroborated (clean 1.2x + sparsity 1.25x agree within tolerance but only 1 non-suspect member), throughput/yield_rate/logic_density uncorroborated (single source; the last with a dangling Intel-18A baseline flagged). A sparsity number never makes a group 'corroborated'; relative claims compare only within a shared baseline; an absolute % claim (yield) is handled, never grouped with a relative one. Hostile-source guards are deferred (Class A, see CLAUDE.md); a naive-vs-hardened diff is invisible on honest data by design.",
++  "entities_reconciled": {
++    "tsmc_n2": {"aliases": ["2nm-class", "N2", "TSMC 2nm"]},
++    "tsmc_n3e": {"aliases": ["N3E"]}
++  },
++  "assessments": [
++    {
++      "entity_id": "tsmc_n2", "metric": "logic_density", "baseline_entity": "intel_18a",
++      "status": "uncorroborated", "members": ["vendorslide:vs_intel"],
++      "value_range": [3.0, 3.0], "spread_pct": 0.0, "tiers": [3],
++      "confidence": "none", "flags": ["single_source", "unresolved_baseline"]
++    },
++    {
++      "entity_id": "tsmc_n2", "metric": "logic_speed", "baseline_entity": "tsmc_n3e",
++      "status": "corroborated",
++      "members": ["hotchips_n2:logic_speed", "tsmc_pr_n2:logic_speed"],
++      "value_range": [1.15, 1.18], "spread_pct": 2.6, "tiers": [1, 2],
++      "confidence": "high", "flags": []
++    },
++    {
++      "entity_id": "tsmc_n2", "metric": "perf_per_watt", "baseline_entity": "tsmc_n3e",
++      "status": "contradicted",
++      "members": ["tsmc_pr_n2:perf_per_watt", "vendorslide:perf_per_watt"],
++      "value_range": [1.3, 1.8], "spread_pct": 38.5, "tiers": [2, 3],
++      "confidence": "low", "flags": ["sparsity"], "favored_tier": 2
++    },
++    {
++      "entity_id": "tsmc_n2", "metric": "sram_density", "baseline_entity": "tsmc_n3e",
++      "status": "weakly_corroborated",
++      "members": ["tsmc_pr_n2:sram_density", "vendorslide:sram_density"],
++      "value_range": [1.2, 1.25], "spread_pct": 4.2, "tiers": [2, 3],
++      "confidence": "medium", "flags": ["sparsity"]
++    },
++    {
++      "entity_id": "tsmc_n2", "metric": "throughput", "baseline_entity": "tsmc_n3e",
++      "status": "uncorroborated", "members": ["vendorslide:throughput"],
++      "value_range": [2.0, 2.0], "spread_pct": 0.0, "tiers": [3],
++      "confidence": "none", "flags": ["single_source", "sparsity"]
++    },
++    {
++      "entity_id": "tsmc_n2", "metric": "yield_rate", "baseline_entity": null,
++      "status": "uncorroborated", "members": ["tsmc_pr_n2:yield_rate"],
++      "value_range": [65.0, 65.0], "spread_pct": 0.0, "tiers": [2],
++      "confidence": "none", "flags": ["single_source"]
++    }
++  ]
++}
+diff --git a/tests/fixtures/analyze/tsmc_n2_corroboration/source_conf.json b/tests/fixtures/analyze/tsmc_n2_corroboration/source_conf.json
+new file mode 100644
+index 0000000..452f799
+--- /dev/null
++++ b/tests/fixtures/analyze/tsmc_n2_corroboration/source_conf.json
+@@ -0,0 +1,23 @@
++{
++  "_note": "Source 2 of 3 — Hot Chips conference paper (tier 1, highest trust). Corroborates the foundry logic_speed within tolerance; calls N2 'TSMC 2nm' (alias-union test).",
++  "document": {
++    "doc_id": "hotchips_n2", "title": "A 2nm-class GAA Nanosheet Platform",
++    "publisher": "Hot Chips", "doc_type": "conference_paper", "source_tier": 1,
++    "publish_date": "2025-08-20", "url": "https://hotchips.example/n2",
++    "file_sha256": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
++    "ingest_date": "2026-01-06"
++  },
++  "entities": [
++    {"entity_id": "tsmc_n2", "entity_type": "process_node", "vendor": "TSMC", "name": "N2", "aliases": ["N2", "TSMC 2nm"]},
++    {"entity_id": "tsmc_n3e", "entity_type": "process_node", "vendor": "TSMC", "name": "N3E", "aliases": ["N3E"]}
++  ],
++  "claims": [
++    {"claim_id": "hotchips_n2:logic_speed", "doc_id": "hotchips_n2", "entity_id": "tsmc_n2",
++     "claim_class": "performance", "metric": "logic_speed", "value": 1.18, "unit": "x",
++     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
++     "conditions": {"stated_caveats": []},
++     "completeness": "complete",
++     "citation": {"page": 4, "quote_span": "measured 1.18x ring-oscillator speed over N3E", "location_type": "unknown"},
++     "corroboration": {"status": "uncorroborated", "related_claim_ids": []}}
++  ]
++}
+diff --git a/tests/fixtures/analyze/tsmc_n2_corroboration/source_foundry.json b/tests/fixtures/analyze/tsmc_n2_corroboration/source_foundry.json
+new file mode 100644
+index 0000000..bbe8375
+--- /dev/null
++++ b/tests/fixtures/analyze/tsmc_n2_corroboration/source_foundry.json
+@@ -0,0 +1,44 @@
++{
++  "_note": "Source 1 of 3 — TSMC foundry PR (tier 2). Post-extraction ExtractionResult + its Document, loaded into the store for the analyze MVP test. Claims are doc-scoped (claim_id = doc_id:metric).",
++  "document": {
++    "doc_id": "tsmc_pr_n2", "title": "TSMC N2 Enters Volume Production",
++    "publisher": "TSMC", "doc_type": "foundry_announcement", "source_tier": 2,
++    "publish_date": "2025-12-01", "url": "https://pr.tsmc.example/n2",
++    "file_sha256": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
++    "ingest_date": "2026-01-05"
++  },
++  "entities": [
++    {"entity_id": "tsmc_n2", "entity_type": "process_node", "vendor": "TSMC", "name": "N2", "aliases": ["N2"]},
++    {"entity_id": "tsmc_n3e", "entity_type": "process_node", "vendor": "TSMC", "name": "N3E", "aliases": ["N3E"]}
++  ],
++  "claims": [
++    {"claim_id": "tsmc_pr_n2:logic_speed", "doc_id": "tsmc_pr_n2", "entity_id": "tsmc_n2",
++     "claim_class": "performance", "metric": "logic_speed", "value": 1.15, "unit": "x",
++     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
++     "conditions": {"stated_caveats": ["at iso-power"]},
++     "completeness": "complete",
++     "citation": {"page": 1, "quote_span": "N2 delivers 1.15x logic speed at iso-power versus N3E.", "location_type": "unknown"},
++     "corroboration": {"status": "uncorroborated", "related_claim_ids": []}},
++    {"claim_id": "tsmc_pr_n2:perf_per_watt", "doc_id": "tsmc_pr_n2", "entity_id": "tsmc_n2",
++     "claim_class": "efficiency", "metric": "perf_per_watt", "value": 1.3, "unit": "x",
++     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
++     "conditions": {"stated_caveats": ["at iso-power"]},
++     "completeness": "complete",
++     "citation": {"page": 1, "quote_span": "N2 improves performance-per-watt 1.3x at iso-power versus N3E.", "location_type": "unknown"},
++     "corroboration": {"status": "uncorroborated", "related_claim_ids": []}},
++    {"claim_id": "tsmc_pr_n2:sram_density", "doc_id": "tsmc_pr_n2", "entity_id": "tsmc_n2",
++     "claim_class": "density", "metric": "sram_density", "value": 1.2, "unit": "x",
++     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
++     "conditions": {"stated_caveats": []},
++     "completeness": "complete",
++     "citation": {"page": 2, "quote_span": "SRAM bit-cell density improves 1.2x over N3E.", "location_type": "unknown"},
++     "corroboration": {"status": "uncorroborated", "related_claim_ids": []}},
++    {"claim_id": "tsmc_pr_n2:yield_rate", "doc_id": "tsmc_pr_n2", "entity_id": "tsmc_n2",
++     "claim_class": "yield", "metric": "yield_rate", "value": 65.0, "unit": "%",
++     "comparison": {"is_relative": false, "baseline_entity": null, "baseline_stated": false},
++     "conditions": {"stated_caveats": []},
++     "completeness": "complete",
++     "citation": {"page": 2, "quote_span": "Defect density supports a 65% D0 yield at risk production.", "location_type": "unknown"},
++     "corroboration": {"status": "uncorroborated", "related_claim_ids": []}}
++  ]
++}
+diff --git a/tests/fixtures/analyze/tsmc_n2_corroboration/source_vendor.json b/tests/fixtures/analyze/tsmc_n2_corroboration/source_vendor.json
+new file mode 100644
+index 0000000..54af76f
+--- /dev/null
++++ b/tests/fixtures/analyze/tsmc_n2_corroboration/source_vendor.json
+@@ -0,0 +1,43 @@
++{
++  "_note": "Source 3 of 3 — vendor marketing slide (tier 3, lowest trust). perf_per_watt CONTRADICTS the foundry number (1.8x vs 1.3x) via the sparsity lever; throughput stands alone; a density claim cites 'Intel 18A' as baseline — an entity NEVER ingested (a dangling cross-document reference, exercising P2). completeness is 'complete' (the conditions, incl. sparsity, ARE disclosed); suspicion is an analyze-layer signal (sparsity / unresolved baseline / tier), NOT marketing_only, because N2-vs-N3E is a same-vendor comparison.",
++  "document": {
++    "doc_id": "vendorslide", "title": "Accelerate on N2 — Partner Deck",
++    "publisher": "AcmeAccel", "doc_type": "vendor_whitepaper", "source_tier": 3,
++    "publish_date": "2026-01-02", "url": "https://acme.example/n2-deck",
++    "file_sha256": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
++    "ingest_date": "2026-01-07"
++  },
++  "entities": [
++    {"entity_id": "tsmc_n2", "entity_type": "process_node", "vendor": "TSMC", "name": "N2", "aliases": ["N2", "2nm-class"]}
++  ],
++  "claims": [
++    {"claim_id": "vendorslide:perf_per_watt", "doc_id": "vendorslide", "entity_id": "tsmc_n2",
++     "claim_class": "efficiency", "metric": "perf_per_watt", "value": 1.8, "unit": "x",
++     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
++     "conditions": {"sparsity": true, "stated_caveats": ["with sparsity enabled"]},
++     "completeness": "complete",
++     "citation": {"page": 1, "quote_span": "Up to 1.8x perf/W vs N3E with sparsity enabled", "location_type": "unknown"},
++     "corroboration": {"status": "uncorroborated", "related_claim_ids": []}},
++    {"claim_id": "vendorslide:throughput", "doc_id": "vendorslide", "entity_id": "tsmc_n2",
++     "claim_class": "performance", "metric": "throughput", "value": 2.0, "unit": "x",
++     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
++     "conditions": {"sparsity": true, "stated_caveats": ["with sparsity enabled"]},
++     "completeness": "complete",
++     "citation": {"page": 2, "quote_span": "2x throughput vs N3E with sparsity enabled", "location_type": "unknown"},
++     "corroboration": {"status": "uncorroborated", "related_claim_ids": []}},
++    {"claim_id": "vendorslide:vs_intel", "doc_id": "vendorslide", "entity_id": "tsmc_n2",
++     "claim_class": "density", "metric": "logic_density", "value": 3.0, "unit": "x",
++     "comparison": {"is_relative": true, "baseline_entity": "intel_18a", "baseline_stated": true},
++     "conditions": {"stated_caveats": []},
++     "completeness": "complete",
++     "citation": {"page": 3, "quote_span": "3x logic density versus Intel 18A", "location_type": "unknown"},
++     "corroboration": {"status": "uncorroborated", "related_claim_ids": []}},
++    {"claim_id": "vendorslide:sram_density", "doc_id": "vendorslide", "entity_id": "tsmc_n2",
++     "claim_class": "density", "metric": "sram_density", "value": 1.25, "unit": "x",
++     "comparison": {"is_relative": true, "baseline_entity": "tsmc_n3e", "baseline_stated": true},
++     "conditions": {"sparsity": true, "stated_caveats": ["with sparsity-aware cells"]},
++     "completeness": "complete",
++     "citation": {"page": 2, "quote_span": "1.25x SRAM density vs N3E with sparsity-aware cells", "location_type": "unknown"},
++     "corroboration": {"status": "uncorroborated", "related_claim_ids": []}}
++  ]
++}
+diff --git a/tests/test_analyze.py b/tests/test_analyze.py
+new file mode 100644
+index 0000000..ba71522
+--- /dev/null
++++ b/tests/test_analyze.py
+@@ -0,0 +1,99 @@
++"""analyze v1 — the MVP acceptance golden + honest-domain unit cases.
++
++The acceptance test loads three curated sources, persists them (with entity
++reconciliation), runs analyze, and asserts the corroboration/divergence verdict.
++Deterministic, offline — no model. The unit tests exercise the algorithm's honest
++branches directly (these bite honest data; hostile-input guards are deferred).
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++from semianalyst import store
++from semianalyst.analyze import analyze_claims, run_analysis
++from semianalyst.store import ClaimView, models as m
++
++FIXTURE = Path(__file__).parent / "fixtures" / "analyze" / "tsmc_n2_corroboration"
++SOURCES = ["source_foundry.json", "source_conf.json", "source_vendor.json"]
++
++
++def _load(conn, path: Path) -> None:
++    data = json.loads(path.read_text())
++    doc = m.Document(**data["document"])
++    entities = [m.Entity(**e) for e in data["entities"]]
++    claims = [m.Claim(**c) for c in data["claims"]]
++    store.persist_extraction(conn, doc, entities, claims)
++
++
++def test_acceptance_golden(tmp_config):
++    store.init_db(tmp_config)
++    conn = store.connect(tmp_config.paths.db_path)
++    try:
++        for name in SOURCES:
++            _load(conn, FIXTURE / name)
++        conn.commit()
++    finally:
++        conn.close()
++
++    report = run_analysis(tmp_config)
++    expected = {k: v for k, v in json.loads((FIXTURE / "expected_analysis.json").read_text()).items()
++                if not k.startswith("_")}
++    assert report.to_dict() == expected
++
++
++# --------------------------------------------------------------------------
++# Unit cases — construct ClaimViews directly, no store.
++# --------------------------------------------------------------------------
++def _cv(claim_id, metric, value, tier, *, is_relative=True, baseline="b",
++        sparsity=None, completeness="complete", unit="x", entity_id="e") -> ClaimView:
++    return ClaimView(claim_id=claim_id, doc_id="d", entity_id=entity_id, metric=metric,
++                     value=value, unit=unit, is_relative=is_relative, baseline_entity=baseline,
++                     sparsity=sparsity, completeness=completeness, source_tier=tier)
++
++
++_INDEX = {"e": ["e"], "b": ["b"]}
++
++
++def test_two_clean_agree_is_corroborated():
++    rep = analyze_claims([_cv("a", "m", 1.15, 2), _cv("z", "m", 1.18, 1)], _INDEX)
++    assert rep.assessments[0].status == "corroborated"
++    assert rep.assessments[0].confidence == "high"
++
++
++def test_clean_plus_sparsity_agree_is_weakly_corroborated():
++    """The enum-gap case: a clean number + a sparsity number agreeing within
++    tolerance is NOT corroborated (only 1 non-suspect) — it's weakly_corroborated."""
++    rep = analyze_claims([_cv("a", "m", 1.20, 2), _cv("z", "m", 1.25, 3, sparsity=True)], _INDEX)
++    assert rep.assessments[0].status == "weakly_corroborated"
++    assert "sparsity" in rep.assessments[0].flags
++
++
++def test_spread_beyond_tolerance_is_contradicted_favoring_higher_tier():
++    rep = analyze_claims([_cv("a", "m", 1.3, 2), _cv("z", "m", 1.8, 3, sparsity=True)], _INDEX)
++    a = rep.assessments[0]
++    assert a.status == "contradicted" and a.favored_tier == 2
++
++
++def test_absolute_and_relative_same_metric_do_not_group():
++    """is_relative is part of the group key — an absolute claim never compares
++    against a relative one of the same metric."""
++    rep = analyze_claims([
++        _cv("rel", "speed", 1.15, 2, is_relative=True, baseline="b"),
++        _cv("abs", "speed", 3.5, 2, is_relative=False, baseline=None, unit="GHz"),
++    ], _INDEX)
++    assert len(rep.assessments) == 2
++    assert {a.status for a in rep.assessments} == {"uncorroborated"}
++
++
++def test_dangling_baseline_is_flagged():
++    rep = analyze_claims([_cv("a", "m", 3.0, 3, baseline="ghost")], {"e": ["e"]})
++    assert "unresolved_baseline" in rep.assessments[0].flags
++
++
++def test_tolerance_boundary():
++    within = analyze_claims([_cv("a", "m", 1.0, 2), _cv("z", "m", 1.10, 1)], _INDEX)
++    assert within.assessments[0].status == "corroborated"   # exactly 10.0% is not > 10.0
++    beyond = analyze_claims([_cv("a", "m", 1.0, 2), _cv("z", "m", 1.12, 1)], _INDEX)
++    assert beyond.assessments[0].status == "contradicted"   # 12% > 10
+diff --git a/tests/test_reconciliation.py b/tests/test_reconciliation.py
+new file mode 100644
+index 0000000..ea53fcc
+--- /dev/null
++++ b/tests/test_reconciliation.py
+@@ -0,0 +1,86 @@
++"""Persistence + entity reconciliation (store.persist_extraction / db.reconcile_entity)."""
++
++from __future__ import annotations
++
++import datetime as dt
++import json
++
++import pytest
++
++from semianalyst import store
++from semianalyst.store import models as m
++
++
++def _doc(doc_id: str) -> m.Document:
++    return m.Document(doc_id=doc_id, title="t", publisher="TSMC",
++                      doc_type=m.DocType.foundry_announcement, source_tier=m.SourceTier.foundry,
++                      url="https://x", file_sha256="0" * 64, ingest_date=dt.date(2026, 1, 1))
++
++
++def _entity(aliases, node=None) -> m.Entity:
++    return m.Entity(entity_id="tsmc_n2", entity_type=m.EntityType.process_node,
++                    vendor="TSMC", name="N2", aliases=aliases, node=node)
++
++
++def _conn(tmp_config):
++    store.init_db(tmp_config)
++    return store.connect(tmp_config.paths.db_path)
++
++
++def test_alias_union_across_documents(tmp_config):
++    conn = _conn(tmp_config)
++    try:
++        store.persist_extraction(conn, _doc("d1"), [_entity(["N2"])], [])
++        store.persist_extraction(conn, _doc("d2"), [_entity(["N2", "TSMC 2nm"])], [])
++        conn.commit()
++        aliases = json.loads(conn.execute(
++            "SELECT aliases FROM entity WHERE entity_id='tsmc_n2'").fetchone()["aliases"])
++        assert set(aliases) == {"N2", "TSMC 2nm"}
++        assert conn.execute("SELECT COUNT(*) AS n FROM entity").fetchone()["n"] == 1
++    finally:
++        conn.close()
++
++
++def test_fill_null_never_overwrites_non_null(tmp_config):
++    conn = _conn(tmp_config)
++    try:
++        # doc1: transistor_type set (non-null); doc2: a DIFFERENT transistor_type
++        # (must NOT overwrite) plus a new backside_power (must fill the null).
++        store.persist_extraction(conn, _doc("d1"),
++            [_entity(["N2"], node=m.NodeAttributes(transistor_type=m.TransistorType.finfet))], [])
++        store.persist_extraction(conn, _doc("d2"),
++            [_entity(["N2"], node=m.NodeAttributes(transistor_type=m.TransistorType.cfet,
++                                                   backside_power=False))], [])
++        conn.commit()
++        row = conn.execute("SELECT node_transistor_type, node_backside_power "
++                           "FROM entity WHERE entity_id='tsmc_n2'").fetchone()
++        assert row["node_transistor_type"] == "finfet"   # first value kept, not clobbered
++        assert row["node_backside_power"] == 0            # null filled from the newcomer
++    finally:
++        conn.close()
++
++
++def test_claim_id_is_document_scoped(tmp_config):
++    conn = _conn(tmp_config)
++    try:
++        store.persist_extraction(conn, _doc("d1"), [_entity(["N2"])], [
++            m.Claim(claim_id="logic_speed", doc_id="d1", entity_id="tsmc_n2",
++                    claim_class=m.ClaimClass.performance, metric="logic_speed", value=1.15, unit="x",
++                    comparison=m.Comparison(is_relative=True, baseline_stated=True),
++                    completeness=m.Completeness.complete,
++                    citation=m.Citation(quote_span="x", location_type=m.LocationType.unknown))])
++        conn.commit()
++        cid = conn.execute("SELECT claim_id FROM claim").fetchone()["claim_id"]
++        assert cid == "d1:logic_speed"
++    finally:
++        conn.close()
++
++
++def test_duplicate_document_is_fail_loud(tmp_config):
++    conn = _conn(tmp_config)
++    try:
++        store.persist_extraction(conn, _doc("d1"), [], [])
++        with pytest.raises(Exception):  # sqlite3.IntegrityError — a duplicate doc_id must raise
++            store.persist_extraction(conn, _doc("d1"), [], [])
++    finally:
++        conn.close()
+diff --git a/tests/test_store.py b/tests/test_store.py
+index a15fd51..6f93f5a 100644
+--- a/tests/test_store.py
++++ b/tests/test_store.py
+@@ -20,7 +20,7 @@ def test_init_db_creates_schema(tmp_config):
+     try:
+         assert {"document", "entity", "claim", "macro_snapshot", "schema_migrations"} <= _tables(conn)
+         applied = conn.execute("SELECT version FROM schema_migrations").fetchall()
+-        assert [r["version"] for r in applied] == [1, 2]  # 0001 initial + 0002 v2 grounding
++        assert [r["version"] for r in applied] == [1, 2, 3]  # initial + v2 grounding + v3 weakly_corroborated
+     finally:
+         conn.close()
+ 
+@@ -31,7 +31,7 @@ def test_init_db_is_idempotent(tmp_config):
+     conn = store.connect(tmp_config.paths.db_path)
+     try:
+         n = conn.execute("SELECT COUNT(*) AS n FROM schema_migrations").fetchone()["n"]
+-        assert n == 2  # both migrations applied once; second init_db is a no-op
++        assert n == 3  # all migrations applied once; second init_db is a no-op
+     finally:
+         conn.close()
+ 
+diff --git a/tests/test_validate.py b/tests/test_validate.py
+index e204286..a6cc6a6 100644
+--- a/tests/test_validate.py
++++ b/tests/test_validate.py
+@@ -226,6 +226,21 @@ def test_marketing_only_tagging_cross_vendor_sparsity():
+     assert result.claims[0].completeness.value == "marketing_only"
+ 
+ 
++def test_sparsity_with_unresolved_baseline_is_not_marketing_only():
++    """The cross-vendor marketing_only test needs BOTH vendors known. A same-vendor
++    sparsity claim whose baseline isn't declared (None vendor) must NOT be tagged
++    marketing_only — that misfire was the bug the analyze gate surfaced."""
++    src = "N2 is 2x versus N3E with sparsity on."
++    p = {"entities": [_entity("tsmc_n2", "TSMC", "N2")],  # N3E baseline NOT declared here
++         "claims": [_claim(entity_id="tsmc_n2", value=2, unit="x",
++             comparison={"is_relative": True, "baseline_entity": "tsmc_n3e", "baseline_stated": True},
++             conditions={"sparsity": True, "stated_caveats": ["with sparsity on"]},
++             completeness="complete",
++             citation={"quote_span": "N2 is 2x versus N3E with sparsity on.", "location_type": "body"})]}
++    result, _ = validate_proposal(p, src)
++    assert result.claims[0].completeness.value != "marketing_only"
++
++
+ def test_shape_invalid_claim_is_dropped_not_fatal():
+     """An off-type field (real models emit sparsity='enabled') drops that claim,
+     never the whole extraction — the other grounded claims survive."""

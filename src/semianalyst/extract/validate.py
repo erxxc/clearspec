@@ -259,12 +259,19 @@ def validate_proposal(
         if (claim.comparison.is_relative and claim.comparison.baseline_entity is None
                 and claim.completeness == models.Completeness.complete):
             claim.completeness = models.Completeness.missing_baseline
-        # marketing_only: sparsity + cross-vendor comparison.
+        # marketing_only: sparsity + a genuine CROSS-VENDOR (competitor) comparison.
+        # BOTH vendors must be known — an unresolved (None) baseline vendor is NOT
+        # treated as "different vendor" (that misfired on same-vendor claims whose
+        # baseline wasn't in the proposal, e.g. a vendor slide citing N2-vs-N3E
+        # without declaring N3E). Sparsity suspicion for same-vendor comparisons is
+        # an analyze-layer signal, not a completeness label.
+        entity_vendor = vendor_of.get(claim.entity_id)
+        baseline_vendor = vendor_of.get(claim.comparison.baseline_entity)
         if (claim.conditions.sparsity is True
                 and claim.comparison.is_relative
-                and claim.comparison.baseline_entity is not None
-                and vendor_of.get(claim.entity_id)
-                != vendor_of.get(claim.comparison.baseline_entity)):
+                and entity_vendor is not None
+                and baseline_vendor is not None
+                and entity_vendor != baseline_vendor):
             claim.completeness = models.Completeness.marketing_only
         _force_unknown(claim.citation)
         kept_claims.append(claim)

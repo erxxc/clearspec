@@ -20,3 +20,12 @@ questions that make this an analyst tool rather than a scraper:
 Design constraint: analysis is read-only over the store and must preserve the
 schema's normalization rules (no relative->absolute conversion).
 """
+
+from .corroborate import (
+    Assessment,
+    AnalysisReport,
+    analyze_claims,
+    run_analysis,
+)
+
+__all__ = ["Assessment", "AnalysisReport", "analyze_claims", "run_analysis"]
