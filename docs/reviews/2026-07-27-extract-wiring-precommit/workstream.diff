@@ -1,0 +1,806 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 7381756..02df8f0 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -86,11 +86,12 @@ enforced with a *named adversarial suite* (never the honest acceptance golden):
+ - **Baseline content-bound** — post-0003 `cmp_baseline_entity` is unconstrained
+   TEXT (the FK drop removed the shape guard too, not just the existence guard). No
+   length/byte-content bound on it or on free-text `metric`.
+-- **Report display safety** — `cli.py:report()` echoes DB-derived strings
+-  (`entity_id`, `aliases`, `metric`, `baseline_entity`) to the terminal with **no
+-  output encoding**. Honest fixtures are inert, but once live extraction feeds
+-  proposal content here, ANSI/OSC escape sequences render on `semianalyst report`
+-  with no code change on the display side. Sanitize output before this ships live.
++- **Report display safety** — RESOLVED 2026-07-27 (WS-1, ahead of live ingest).
++  `cli.py:report()` now sanitizes every DB-derived display string (`entity_id`,
++  `aliases`, `metric`, `baseline_entity`) through `cli._ansi_safe`, which strips
++  ANSI/OSC/control sequences. Terminal output encoding lives at the CLI edge
++  deliberately (a web UI would HTML-escape the same values instead), so it is not a
++  shared library capability. Covered by `test_report_display_is_ansi_sanitized`.
+ - **I/J** — persisted conflict records; slug-collision detection strength.
+ `validate.py` enforces a per-DOCUMENT boundary only; cross-document trust is Class A.
+ 
+@@ -105,14 +106,31 @@ Raw docs are keyed by sha256 under `data/raw/`. Re-fetching unchanged bytes is a
+ no-op; a changed hash is a new file (this is how silent revisions of the same URL
+ are detected — see the schema's `file_sha256`).
+ 
++## The ingest→extract handoff is a provenance sidecar (decided 2026-07-27, WS-1)
++Each raw blob at `data/raw/<sha256>` has a sidecar `data/raw/<sha256>.meta.json`
++carrying exactly the Document-construction metadata ingest knows (`doc_id`,
++`title`, `publisher`, `doc_type`, `source_tier`, `url`, `publish_date`,
++`ingest_date`, `file_sha256`) — **not** `extraction_model`, which `run_extract`
++stamps at extraction time. **Whatever produces the bytes writes the same sidecar
++shape** — the operator path `ingest.ingest_file` today, WS-2's network fetcher
++later — so `extract` stays fetch-source-agnostic. The `Document` row is created at
++**extract** time (`persist_extraction` inserts it, unchanged), not at ingest;
++`run_extract` skips any sidecar whose `doc_id` is already in the store
++(`store.existing_doc_ids`), so re-runs are idempotent. Alternatives considered and
++rejected for the MVP: a `pending_raw` DB table (needless migration; ingest stays
++DB-free) and an ingest-time Document with a status lifecycle (would split the
++reviewed `persist_extraction` contract). See `docs/ROADMAP.md`.
++
+ ## Secrets never land in the repo
+ The extraction model name lives in `config.toml`; the API key is read from the
+ environment (`ANTHROPIC_API_KEY`) at call time and is never committed. `data/` is
+ gitignored in full.
+ 
+ ## Module map
+-- `ingest/`  — fetchers + content-addressed raw storage (network fetch: WIP)
+-- `extract/` — raw doc → schema records via a versioned prompt (LLM: WIP/stub)
++- `ingest/`  — fetchers + content-addressed raw storage + provenance sidecars
++  (`ingest_file` operator path live; network fetch: WIP/WS-2)
++- `extract/` — raw doc → schema records via a versioned prompt; `run_extract` wires
++  ingest (sidecar) → extractor → `persist_extraction`
+ - `store/`   — SQLite persistence + entity reconciliation; sole DB owner
+ - `analyze/` — cross-source corroboration + divergence (v1: tolerance grouping,
+   suspect members excluded from the corroborated count, tier-blind `favored_tier`
+diff --git a/README.md b/README.md
+index ef179bc..eb88965 100644
+--- a/README.md
++++ b/README.md
+@@ -11,6 +11,6 @@ uv run semianalyst ingest       # fetch the watchlist in config.toml (network fe
+ uv run semianalyst report       # summarize stored documents / entities / claims
+ ```
+ 
+-`db init` applies the numbered migrations under `src/semianalyst/store/migrations/` and is safe to re-run. `ingest` stores raw docs content-addressed by sha256 under `data/raw/` (idempotent — an unchanged doc is a no-op; a changed one is a new file). `data/` is gitignored. Run the tests with `uv run pytest` (the golden-extraction harness `xfail`s until the LLM extractor lands).
++`db init` applies the numbered migrations under `src/semianalyst/store/migrations/` and is safe to re-run. `ingest` stores raw docs content-addressed by sha256 under `data/raw/` (idempotent — an unchanged doc is a no-op; a changed one is a new file; network fetch is WIP). `data/` is gitignored. Run the tests with `uv run pytest`: the offline golden replays a recorded, provenance-stamped model response (it *skips* until recorded via `--run-live --record`), and `--run-live` (with `ANTHROPIC_API_KEY`) runs the real extractor — the true gate.
+ 
+-See `CLAUDE.md` for the architectural rules and `schema/extraction_schema_v1.yaml` for the data model (the source of truth).
++See `CLAUDE.md` for the architectural rules, `schema/extraction_schema_v3.yaml` for the data model (the source of truth; `_v1`/`_v2` are retained unedited), and `docs/ROADMAP.md` for current status and priority.
+diff --git a/config.toml b/config.toml
+index 17fa381..1228a97 100644
+--- a/config.toml
++++ b/config.toml
+@@ -2,7 +2,9 @@
+ # Loaded exclusively by src/semianalyst/config.py. Nothing else reads this file.
+ 
+ [model]
+-# Extraction model + prompt version. NOT wired up yet — extract/ is a stub this phase.
++# Extraction model + prompt version. The extractor (extract/base.py + validate.py)
++# is built and tested; the run_extract orchestration that reads ingested raw docs
++# and persists claims is the active workstream (see docs/ROADMAP.md, WS-1).
+ # The API key is read from the ANTHROPIC_API_KEY environment variable, never stored here.
+ name = "claude-opus-4-8"
+ prompt_version = "extract_foundry_v1"
+diff --git a/docs/ROADMAP.md b/docs/ROADMAP.md
+new file mode 100644
+index 0000000..c82d119
+--- /dev/null
++++ b/docs/ROADMAP.md
+@@ -0,0 +1,130 @@
++# ROADMAP — semianalyst
++
++**This file is the source of truth for _what is built, what is open, and what
++order we build it in._** It does not restate architectural rules or decision
++history — those live where they are authoritative:
++
++- **Architectural rules + the Class A deferred-decision definitions:** `CLAUDE.md`.
++  This file _references_ Class A items (K/G/H/…) by name; it never redefines them.
++- **Per-gate decisions and their rationale:** `docs/reviews/<date>-<workstream>-<plan|precommit>/resolution.md`.
++- **The data model:** `schema/extraction_schema_v3.yaml` (current).
++
++Keep this file honest on every workstream boundary: when a slice lands, move its
++row from *Open* to *Built*; when a Class A item is retired, strike it here and in
++CLAUDE.md in the same commit.
++
++_Last updated: 2026-07-27._
++
++---
++
++## Current state — the pipeline is 4 stages; 2 live, 2 stubs, glue missing
++
++| Stage | State | Notes |
++|---|---|---|
++| `ingest/` fetch | **STUB** | `FoundryFetcher.fetch` → `NotImplementedError`; `run_ingest` reports every source *skipped*. Only `store_raw` (content-addressed blob write) is real + tested. |
++| `extract/` extractor | **BUILT + tested** | `AnthropicExtractor`, `validate.py` grounding, versioned prompts, offline golden (recorded `llm_response.json`) + `@live` anchor. |
++| `extract/` orchestration (`run_extract`) | **STUB** | The missing wire: read ingested raw → run extractor → `persist_extraction`. |
++| `store/` persist + reconcile | **BUILT**, uncalled in prod | `persist_extraction` unit-tested; nothing outside tests invokes it (blocked on `run_extract`). |
++| `analyze/` corroboration | **BUILT + tested** | Derive-on-read, tolerance grouping, tier-blind `favored_tier`. |
++
++Offline suite baseline (2026-07-27): **49 passed, 2 skipped** (the 2 `@live`
++extraction tests). Branch: `feat/analyze-v1`.
++
++---
++
++## Prioritized workstreams
++
++### WS-1 — Wire `run_extract` (extract E2E on operator-fed raw docs) — **IN PROGRESS (code done; review gate pending)**
++
++Turns three built components (extractor, persist, analyze) into a working
++pipeline with **zero network**. Operator hand-feeds a curated PDF → `extract` →
++`report`.
++
++- **Value-per-risk:** highest. Makes the product demoable; exercises
++  `persist_extraction` in production for the first time.
++- **Class-A-free by construction:** an operator hand-feeding one curated PDF is
++  still the curated-fixture trust boundary — no hostile document reaches
++  `persist_extraction`, so none of the deferred decisions are forced yet.
++- **Forces one directional decision up front:** the ingest→extract Document
++  handoff contract (see *Open directional decisions*). Blocked on human input.
++
++**Pull-forward (unconditional, lands in this slice):** *report display safety* —
++`cli.py:report()` currently echoes DB-derived strings with no output encoding. It
++is the first thing hostile proposal content hits, and unlike the rest of Class A
++it is not entangled with a design fork. Sanitize (strip ANSI/OSC) and retire it
++from the Class A list here + in CLAUDE.md.
++
++**Definition of done:**
++- [x] Decide + document the ingest→extract Document handoff. **Decided
++  2026-07-27: sidecar manifest + extract-time Document** (see *Sequencing decision
++  log* and CLAUDE.md "The ingest→extract handoff is a provenance sidecar").
++- [x] `run_extract` reads pending raw docs (`ingest.read_raw_docs`), runs
++  `AnthropicExtractor` with the configured `PromptVersion`, and calls
++  `persist_extraction`. Idempotent via `store.existing_doc_ids`. Extractor is
++  injectable so the chain runs offline. No business logic in `cli.py`.
++- [x] Operator ingest path (`ingest.ingest_file` + thin `ingest-file` command)
++  writes blob + sidecar, so the pipeline is usable with zero network.
++- [x] `report()` output is encoding-sanitized (`cli._ansi_safe`); Class A
++  "report display safety" **retired** (struck in CLAUDE.md).
++- [x] New E2E test (`tests/test_pipeline_e2e.py`): `ingest_file` → `run_extract`
++  (offline via `ReplayModelClient`) → store counts + `report` assessments, plus an
++  idempotent-re-run check and a sanitizer test. `@live` E2E variant behind
++  `--run-live`.
++- [x] README + `config.toml` drift fixed; `extraction_model` stamp records
++  `model + prompt.name@sha256[:12]`.
++- [x] Offline suite green (**52 passed, 3 skipped**; the 3 skips are the `@live`
++  extraction + injection + new `@live` E2E). Live extraction remains the anchor.
++- [ ] **Adversarial review gate (plan + precommit) per `docs/reviews/README.md`
++  before commit.** Reviewers are invoked only explicitly as part of a gate — NOT
++  run yet. This is the remaining gate before this workstream is committed.
++
++### WS-2 — Live ingest (network fetch) + Class A trust model — **AFTER WS-1, gated**
++
++Implements `FoundryFetcher.fetch` (HTTPS-only, rate-limited, idempotent via
++`store_raw`) and `run_ingest`. **The moment fetch lands, the entire Class A set
++goes live simultaneously** — so this workstream MUST open with a *trust-model
++design gate* (swarm review) that resolves the deferred decisions as a named set,
++not piecemeal. Class A items (defined in CLAUDE.md): **K** (tier precedence /
++`favored_tier` suspect-exclusion), **G** (alias-union gating), **H**
++(tier-diversity floor for `corroborated`), resolved-baseline poisoning,
++identity-field conflict, baseline content-bound, **I/J** (persisted conflict
++records, slug-collision strength). Adversarial suite must be a *named hostile
++suite*, never the honest acceptance golden.
++
++### Deferred (correctly) — revisit on trigger
++
++- **Analyze decision A — absolute tolerance.** One relative ±10% ruler is applied
++  to both ratios and absolute claims. Moot until two absolute claims share a
++  group (today the only absolute claim is a singleton). Revisit trigger: a second
++  absolute claim groups. (Decision B was resolved — B2 applied; see
++  `docs/reviews/2026-07-20-analyze-precommit/resolution.md`.)
++
++---
++
++## Open directional decisions (human-owned)
++
++- **WS-1 / ingest→extract Document handoff contract** — *RESOLVED 2026-07-27:
++  sidecar manifest + extract-time Document* (see decision log below). No open
++  question remains.
++- **Analyze decision A** — deferred with a named trigger (above).
++
++---
++
++## Sequencing decision log
++
++- **2026-07-27 — extract-wiring before live-ingest (confirmed by human).**
++  Context: two stubs (ingest fetch, `run_extract`) block the E2E loop; persist +
++  analyze already built. Options: (1) wire `run_extract` first, (2) live ingest
++  first. Decision: **(1)**. Consequence: product becomes demoable on operator-fed
++  input with zero network and zero Class A exposure; live ingest follows as a
++  gated workstream once the chain is proven end-to-end on trusted input.
++- **2026-07-27 — ingest→extract handoff: sidecar + extract-time Document
++  (human).** Context: a bare `data/raw/<sha256>` blob carries no trust metadata,
++  so something must record it and tell `extract` what's pending. Options:
++  (A) sidecar JSON on disk + Document built at extract time; (B) a `pending_raw` DB
++  table; (C) ingest-time Document with a status lifecycle. Decision: **(A)**.
++  Consequence: no migration; ingest stays DB-free (matches "raw blobs are ingest's
++  concern"); `persist_extraction`'s reviewed insert contract is untouched; the
++  sidecar is the fetch-source-agnostic seam WS-2's network fetcher reuses. Cost
++  accepted: "what's pending" lives in scattered files, not one queryable table —
++  fine at operator scale; revisit if WS-2 needs queryable ingest state.
+diff --git a/src/semianalyst/cli.py b/src/semianalyst/cli.py
+index 93022cd..a59a6dd 100644
+--- a/src/semianalyst/cli.py
++++ b/src/semianalyst/cli.py
+@@ -5,17 +5,25 @@ nothing else. Zero business logic lives here. Every command delegates to a
+ library entry point that a web UI could call identically. If you find yourself
+ writing a loop, a query, or a transformation in this file, it belongs in a
+ library module instead.
++
++The one thing that DOES live here is terminal output encoding (`_ansi_safe`):
++sanitizing DB-derived strings against ANSI/OSC escapes is a display-edge concern
++specific to a terminal sink — a web UI would HTML-escape the same values instead,
++so it is not a shared library capability. It guards the day live extraction feeds
++proposal-controlled strings (metric, baseline_entity, aliases) into `report`.
+ """
+ 
+ from __future__ import annotations
+ 
++import re
++
+ import typer
+ 
+ from . import store
+ from .analyze import run_analysis
+ from .config import load_config
+ from .extract.pipeline import run_extract
+-from .ingest.pipeline import run_ingest
++from .ingest.pipeline import ingest_file, run_ingest
+ 
+ app = typer.Typer(
+     help="semianalyst — ingest semiconductor releases and extract quantitative claims.",
+@@ -26,6 +34,21 @@ app = typer.Typer(
+ db_app = typer.Typer(help="Database management.", no_args_is_help=True)
+ app.add_typer(db_app, name="db")
+ 
++# ANSI/OSC + control-char stripping for untrusted, DB-derived display strings.
++# OSC (ESC ] ... BEL/ST) first, then CSI/other ESC sequences, then any residual
++# control bytes (bare ESC and the C1 CSI introducer 0x9b) so a partial sequence
++# can't survive as a live escape.
++_ANSI_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
++_ANSI_CSI = re.compile(r"\x1b[@-_][0-?]*[ -/]*[@-~]")
++_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
++
++
++def _ansi_safe(text: str) -> str:
++    """Neutralize terminal escape sequences in an untrusted display string."""
++    text = _ANSI_OSC.sub("", text)
++    text = _ANSI_CSI.sub("", text)
++    return _CTRL.sub("", text)
++
+ 
+ @db_app.command("init")
+ def db_init() -> None:
+@@ -48,14 +71,34 @@ def ingest() -> None:
+         typer.echo(f"  skipped: {name}")
+ 
+ 
++@app.command("ingest-file")
++def ingest_file_cmd(
++    path: str = typer.Argument(..., help="Local file to ingest (e.g. a PDF)."),
++    doc_id: str = typer.Option(..., help="Stable id for this document."),
++    title: str = typer.Option(...),
++    publisher: str = typer.Option(...),
++    doc_type: str = typer.Option(..., help="Schema DocType, e.g. foundry_announcement."),
++    source_tier: int = typer.Option(..., help="1=conference, 2=foundry, 3=vendor."),
++    url: str = typer.Option(...),
++    publish_date: str = typer.Option(None, help="ISO date the source was published."),
++) -> None:
++    """Ingest a local file (content-addressed) and write its provenance sidecar."""
++    raw = ingest_file(
++        load_config(), path, doc_id=doc_id, title=title, publisher=publisher,
++        doc_type=doc_type, source_tier=source_tier, url=url, publish_date=publish_date,
++    )
++    typer.echo(f"ingested {raw.sha256[:12]}  doc_id={_ansi_safe(raw.meta['doc_id'])}")
++
++
+ @app.command()
+ def extract() -> None:
+     """Extract claims from ingested raw docs into the canonical schema."""
+-    try:
+-        run_extract(load_config())
+-    except NotImplementedError as exc:
+-        typer.echo(str(exc))
+-        raise typer.Exit(code=1)
++    report = run_extract(load_config())
++    if report.note:
++        typer.echo(report.note)
++    typer.echo(f"extracted: {len(report.extracted)}  skipped: {len(report.skipped)}")
++    for doc_id in report.extracted:
++        typer.echo(f"  extracted: {_ansi_safe(doc_id)}")
+ 
+ 
+ @app.command()
+@@ -66,11 +109,12 @@ def report() -> None:
+         typer.echo("no claims in the store — nothing to corroborate yet.")
+         return
+     for entity_id, info in analysis.entities_reconciled.items():
+-        typer.echo(f"{entity_id}  aliases={info['aliases']}")
++        aliases = [_ansi_safe(a) for a in info["aliases"]]
++        typer.echo(f"{_ansi_safe(entity_id)}  aliases={aliases}")
+     for a in analysis.assessments:
+-        line = f"  [{a.status}] {a.metric}"
++        line = f"  [{a.status}] {_ansi_safe(a.metric)}"
+         if a.baseline_entity:
+-            line += f" vs {a.baseline_entity}"
++            line += f" vs {_ansi_safe(a.baseline_entity)}"
+         line += f"  range={a.value_range} tiers={a.tiers} confidence={a.confidence}"
+         if a.flags:
+             line += f" flags={a.flags}"
+diff --git a/src/semianalyst/extract/__init__.py b/src/semianalyst/extract/__init__.py
+index f6c2869..fc35fb9 100644
+--- a/src/semianalyst/extract/__init__.py
++++ b/src/semianalyst/extract/__init__.py
+@@ -10,6 +10,7 @@ from .base import (
+     ModelClient,
+     ReplayModelClient,
+ )
++from .pipeline import ExtractReport, run_extract
+ from .prompts import PromptVersion
+ from .validate import (
+     ExtractionError,
+@@ -24,6 +25,8 @@ __all__ = [
+     "AnthropicModelClient",
+     "ModelClient",
+     "ReplayModelClient",
++    "ExtractReport",
++    "run_extract",
+     "PromptVersion",
+     "ExtractionError",
+     "ExtractionResult",
+diff --git a/src/semianalyst/extract/pipeline.py b/src/semianalyst/extract/pipeline.py
+index 3c894ad..ec228be 100644
+--- a/src/semianalyst/extract/pipeline.py
++++ b/src/semianalyst/extract/pipeline.py
+@@ -1,18 +1,84 @@
+ """Extract orchestration — the library entry point behind `semianalyst extract`.
+ 
+-Stubbed this phase: raises NotImplementedError. When implemented it will read raw
+-docs from the store's ingested set, run the configured Extractor + PromptVersion,
+-and persist the resulting entities/claims through store.db.
++Wires the three built pieces into a pipeline: read each ingested raw doc (blob +
++provenance sidecar) that hasn't been extracted yet, run the configured Extractor +
++PromptVersion, and persist the grounded entities/claims through store. Read-side
++of the ingest->extract handoff decided in docs/ROADMAP.md (sidecar + extract-time
++Document): ingest writes the sidecar; extract builds the Document from it and
++persist_extraction inserts it (unchanged).
++
++The Extractor is injectable so the full pipeline runs offline (ReplayModelClient,
++no network, no API key) in tests; the default builds the real Anthropic client,
++which is exercised by the @live E2E test — the ENFORCE anchor for the wiring.
+ """
+ 
+ from __future__ import annotations
+ 
++from dataclasses import dataclass, field
++
++from .. import store
+ from ..config import Config, load_config
++from ..ingest import read_raw_docs
++from ..store import models
++from .base import AnthropicExtractor, AnthropicModelClient
++from .prompts import PromptVersion
++
++
++@dataclass
++class ExtractReport:
++    extracted: list[str] = field(default_factory=list)  # doc_ids newly persisted
++    skipped: list[str] = field(default_factory=list)     # doc_ids already in the store
++    note: str = ""
+ 
+ 
+-def run_extract(config: Config | None = None) -> None:
+-    config = config or load_config()  # noqa: F841 — validates config loads even in the stub
+-    raise NotImplementedError(
+-        "Extraction is not implemented yet (structure-only phase). "
+-        "The golden-fixture harness in tests/ is built and xfails until this lands."
++def _build_document(meta: dict, model_name: str, prompt: PromptVersion) -> models.Document:
++    """Construct the Document from the ingest sidecar. This is where the sidecar's
++    operator-supplied fields (doc_type, source_tier, dates) are validated — pydantic
++    fails loud on a bad value, naming the field. extraction_model records the exact
++    (model, prompt bytes) provenance of this run; file_sha256 is authoritative from
++    ingest and the doc_id is context, never a model output."""
++    return models.Document(
++        doc_id=meta["doc_id"],
++        title=meta["title"],
++        publisher=meta["publisher"],
++        doc_type=meta["doc_type"],
++        source_tier=meta["source_tier"],
++        publish_date=meta.get("publish_date"),
++        url=meta["url"],
++        file_sha256=meta["file_sha256"],
++        ingest_date=meta["ingest_date"],
++        extraction_model=f"{model_name}+{prompt.name}@{prompt.sha256[:12]}",
+     )
++
++
++def run_extract(config: Config | None = None, *, extractor: AnthropicExtractor | None = None) -> ExtractReport:
++    """Extract claims from ingested raw docs into the store. Idempotent: a doc
++    already persisted is skipped, so re-running only processes new ingests."""
++    config = config or load_config()
++    conn = store.connect(config.paths.db_path)
++    try:
++        already = store.existing_doc_ids(conn)
++        raw_docs = read_raw_docs(config.paths.raw_dir)
++        pending = [rd for rd in raw_docs if rd.meta["doc_id"] not in already]
++        skipped = [rd.meta["doc_id"] for rd in raw_docs if rd.meta["doc_id"] in already]
++        if not pending:
++            note = "no pending raw docs — ingest one with `semianalyst ingest-file`." if not raw_docs else ""
++            return ExtractReport(extracted=[], skipped=skipped, note=note)
++
++        prompt = PromptVersion.load(config.model.prompt_version)
++        # Build the real Anthropic extractor only when there is work AND no client
++        # was injected — so `extract` with nothing pending never needs an API key.
++        extractor = extractor or AnthropicExtractor(AnthropicModelClient(config.model.name))
++
++        extracted: list[str] = []
++        for rd in pending:
++            document = _build_document(rd.meta, config.model.name, prompt)
++            result = extractor.extract(rd.blob_path.read_bytes(), document, prompt)
++            # One short transaction per document: the model call already happened
++            # above; commit the persisted rows atomically or roll the doc back.
++            with conn:
++                store.persist_extraction(conn, document, result.entities, result.claims)
++            extracted.append(document.doc_id)
++        return ExtractReport(extracted=extracted, skipped=skipped)
++    finally:
++        conn.close()
+diff --git a/src/semianalyst/ingest/__init__.py b/src/semianalyst/ingest/__init__.py
+index 0049a80..f244f1b 100644
+--- a/src/semianalyst/ingest/__init__.py
++++ b/src/semianalyst/ingest/__init__.py
+@@ -1,6 +1,27 @@
+ """ingest — fetch raw releases and store them content-addressed by sha256."""
+ 
+-from .base import Fetcher, RawRef, SourceRef, store_raw
++from .base import (
++    Fetcher,
++    RawDoc,
++    RawRef,
++    SourceRef,
++    read_raw_docs,
++    store_raw,
++    write_sidecar,
++)
+ from .foundry import FoundryFetcher
++from .pipeline import IngestReport, ingest_file, run_ingest
+ 
+-__all__ = ["Fetcher", "RawRef", "SourceRef", "store_raw", "FoundryFetcher"]
++__all__ = [
++    "Fetcher",
++    "RawDoc",
++    "RawRef",
++    "SourceRef",
++    "read_raw_docs",
++    "store_raw",
++    "write_sidecar",
++    "FoundryFetcher",
++    "IngestReport",
++    "ingest_file",
++    "run_ingest",
++]
+diff --git a/src/semianalyst/ingest/base.py b/src/semianalyst/ingest/base.py
+index 654ad64..cff5b98 100644
+--- a/src/semianalyst/ingest/base.py
++++ b/src/semianalyst/ingest/base.py
+@@ -11,10 +11,18 @@ how the schema's `file_sha256` detects silent revisions of the same URL.
+ from __future__ import annotations
+ 
+ import hashlib
++import json
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Iterable, Protocol
+ 
++# A raw blob is stored at raw_dir/<sha256> (no suffix). Its provenance sidecar —
++# the metadata needed to build a Document at extract time — lives beside it at
++# raw_dir/<sha256>.meta.json. The sidecar is the ingest->extract handoff seam:
++# whatever produced the bytes (an operator today, a network fetcher in WS-2)
++# writes the SAME sidecar shape, so extract stays fetch-source-agnostic.
++SIDECAR_SUFFIX = ".meta.json"
++
+ 
+ @dataclass(frozen=True)
+ class SourceRef:
+@@ -35,6 +43,19 @@ class RawRef:
+     is_new: bool  # False when the identical bytes were already stored (idempotent no-op)
+ 
+ 
++@dataclass(frozen=True)
++class RawDoc:
++    """A stored raw blob paired with the provenance metadata that lets extract
++    reconstruct its Document. `meta` carries exactly the Document-construction
++    fields ingest knows (doc_id, title, publisher, doc_type, source_tier, url,
++    publish_date, ingest_date, file_sha256) — NOT extraction_model, which extract
++    stamps once a run happens."""
++
++    sha256: str
++    blob_path: Path
++    meta: dict
++
++
+ def store_raw(content: bytes, raw_dir: Path) -> RawRef:
+     """Store bytes content-addressed under raw_dir. Idempotent by sha256."""
+     digest = hashlib.sha256(content).hexdigest()
+@@ -50,6 +71,34 @@ def store_raw(content: bytes, raw_dir: Path) -> RawRef:
+     return RawRef(sha256=digest, path=dest, is_new=True)
+ 
+ 
++def write_sidecar(raw_dir: Path, sha256: str, meta: dict) -> Path:
++    """Write the provenance sidecar for a stored blob (atomic). Overwrites an
++    existing sidecar: the blob is content-addressed, so identical bytes always map
++    to the same doc metadata for a given ingest — re-writing is a safe no-op-ish."""
++    raw_dir.mkdir(parents=True, exist_ok=True)
++    dest = raw_dir / f"{sha256}{SIDECAR_SUFFIX}"
++    tmp = dest.with_suffix(".meta.partial")
++    tmp.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
++    tmp.replace(dest)
++    return dest
++
++
++def read_raw_docs(raw_dir: Path) -> list[RawDoc]:
++    """Every raw blob that has a provenance sidecar, sorted by sha256 for a stable
++    processing order. A sidecar whose blob is absent (a corrupt/partial state) is
++    skipped — it is not an ingested document."""
++    if not raw_dir.exists():
++        return []
++    docs: list[RawDoc] = []
++    for sidecar in sorted(raw_dir.glob(f"*{SIDECAR_SUFFIX}")):
++        sha256 = sidecar.name[: -len(SIDECAR_SUFFIX)]
++        blob = raw_dir / sha256
++        if not blob.exists():
++            continue
++        docs.append(RawDoc(sha256=sha256, blob_path=blob, meta=json.loads(sidecar.read_text())))
++    return docs
++
++
+ class Fetcher(Protocol):
+     """A source-specific fetcher.
+ 
+diff --git a/src/semianalyst/ingest/pipeline.py b/src/semianalyst/ingest/pipeline.py
+index 2749427..e56a505 100644
+--- a/src/semianalyst/ingest/pipeline.py
++++ b/src/semianalyst/ingest/pipeline.py
+@@ -1,15 +1,25 @@
+-"""Ingest orchestration — the library entry point behind `semianalyst ingest`.
++"""Ingest orchestration — the library entry points behind `semianalyst ingest`
++and `semianalyst ingest-file`.
+ 
+-Iterates the config watchlist and drives the per-source fetchers. Network fetch
+-is stubbed this phase, so sources are reported as skipped rather than fetched.
+-Both the CLI and a future web UI call run_ingest().
++`run_ingest` iterates the config watchlist and drives the per-source fetchers.
++Network fetch is stubbed this phase (WS-2), so watchlist sources are reported as
++skipped rather than fetched.
++
++`ingest_file` is the operator path that works TODAY, with zero network: it stores
++a local file content-addressed and writes its provenance sidecar, so `extract`
++can pick it up. This keeps the curated-fixture trust boundary — an operator
++hand-feeds a document; no hostile document reaches the store. Both the CLI and a
++future web UI call these.
+ """
+ 
+ from __future__ import annotations
+ 
++import datetime as dt
+ from dataclasses import dataclass, field
++from pathlib import Path
+ 
+ from ..config import Config, load_config
++from .base import RawDoc, store_raw, write_sidecar
+ 
+ 
+ @dataclass
+@@ -22,10 +32,46 @@ class IngestReport:
+ def run_ingest(config: Config | None = None) -> IngestReport:
+     config = config or load_config()
+     report = IngestReport(
+-        note="network fetch not implemented yet (structure-only phase); "
+-        "idempotent raw storage is available via ingest.store_raw."
++        note="network fetch not implemented yet (WS-2); ingest a local file with "
++        "ingest.ingest_file / `semianalyst ingest-file`."
+     )
+     for source in config.sources:
+         # A real fetcher would run here and append new sha256s to report.fetched.
+         report.skipped.append(source.name)
+     return report
++
++
++def ingest_file(
++    config: Config,
++    source_path: str | Path,
++    *,
++    doc_id: str,
++    title: str,
++    publisher: str,
++    doc_type: str,
++    source_tier: int,
++    url: str,
++    publish_date: str | None = None,
++    ingest_date: str | None = None,
++) -> RawDoc:
++    """Store a local file content-addressed and write its provenance sidecar.
++
++    The (doc_type, source_tier, publish_date) fields are recorded verbatim and
++    validated at extract time when the Document is constructed (pydantic) — ingest
++    stays decoupled from the store's model. Returns the stored RawDoc.
++    """
++    content = Path(source_path).read_bytes()
++    raw = store_raw(content, config.paths.raw_dir)
++    meta = {
++        "doc_id": doc_id,
++        "title": title,
++        "publisher": publisher,
++        "doc_type": doc_type,
++        "source_tier": source_tier,
++        "url": url,
++        "publish_date": publish_date,
++        "ingest_date": ingest_date or dt.date.today().isoformat(),
++        "file_sha256": raw.sha256,
++    }
++    write_sidecar(config.paths.raw_dir, raw.sha256, meta)
++    return RawDoc(sha256=raw.sha256, blob_path=raw.path, meta=meta)
+diff --git a/src/semianalyst/store/__init__.py b/src/semianalyst/store/__init__.py
+index 20a584d..26d8df9 100644
+--- a/src/semianalyst/store/__init__.py
++++ b/src/semianalyst/store/__init__.py
+@@ -8,6 +8,7 @@ from . import models
+ from .db import (
+     ClaimView,
+     connect,
++    existing_doc_ids,
+     get_claims_for_analysis,
+     get_entities_index,
+     init_db,
+@@ -24,6 +25,7 @@ __all__ = [
+     "models",
+     "ClaimView",
+     "connect",
++    "existing_doc_ids",
+     "get_claims_for_analysis",
+     "get_entities_index",
+     "init_db",
+diff --git a/src/semianalyst/store/db.py b/src/semianalyst/store/db.py
+index 548bcc8..518e047 100644
+--- a/src/semianalyst/store/db.py
++++ b/src/semianalyst/store/db.py
+@@ -176,6 +176,13 @@ def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
+     return {t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"] for t in tables}
+ 
+ 
++def existing_doc_ids(conn: sqlite3.Connection) -> set[str]:
++    """doc_ids already persisted. `run_extract` uses this to skip a raw doc it has
++    already extracted, so a re-run is idempotent instead of failing on the plain
++    INSERT's duplicate-doc_id guard in persist_extraction."""
++    return {row["doc_id"] for row in conn.execute("SELECT doc_id FROM document")}
++
++
+ from dataclasses import dataclass
+ 
+ 
+diff --git a/tests/test_pipeline_e2e.py b/tests/test_pipeline_e2e.py
+new file mode 100644
+index 0000000..ec9d96f
+--- /dev/null
++++ b/tests/test_pipeline_e2e.py
+@@ -0,0 +1,120 @@
++"""End-to-end pipeline wiring: ingest_file -> run_extract -> persist -> report.
++
++Proves the glue WS-1 added, not the components (each is covered by its own suite):
++  - `test_extract_e2e_offline` drives the WHOLE chain with an injected
++    ReplayModelClient (no network, no API key). It asserts the recorded golden
++    proposal lands in the store as the expected rows, that analyze reads them back
++    through the report path with doc-scoped claim_ids, and that a re-run is
++    idempotent (already-persisted docs are skipped, not re-inserted).
++  - `test_extract_e2e_live` (@live) runs the SAME chain against the real extractor
++    — the ENFORCE anchor for the wiring — and skips on a plain `uv run pytest`.
++  - `test_report_display_is_ansi_sanitized` covers the report display-safety guard.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from semianalyst import store
++from semianalyst.analyze import run_analysis
++from semianalyst.cli import _ansi_safe
++from semianalyst.config import Config, PathsConfig, load_config
++from semianalyst.extract import AnthropicExtractor, ReplayModelClient, run_extract
++from semianalyst.ingest import ingest_file
++
++FIXTURES_DIR = Path(__file__).parent / "fixtures"
++CASE_DIR = FIXTURES_DIR / "tsmc_n2_2025"
++DOC_ID = "tsmc_n2_2025"
++
++_INGEST_KW = dict(
++    doc_id=DOC_ID, title="TSMC N2", publisher="TSMC",
++    doc_type="foundry_announcement", source_tier=2,
++    url="https://example.test/tsmc_n2_2025", ingest_date="2026-01-01",
++)
++
++
++def _expected() -> dict:
++    data = json.loads((CASE_DIR / "expected.json").read_text())
++    return {k: v for k, v in data.items() if not k.startswith("_")}
++
++
++def _counts(config: Config) -> dict[str, int]:
++    conn = store.connect(config.paths.db_path)
++    try:
++        return store.table_counts(conn)
++    finally:
++        conn.close()
++
++
++def test_extract_e2e_offline(tmp_config: Config):
++    store.init_db(tmp_config)
++    ingest_file(tmp_config, CASE_DIR / "raw.pdf", **_INGEST_KW)
++
++    # The recorded golden proposal, fed as canned model output — exercises the real
++    # parse + validate + ground + persist path without a live call.
++    recorded = json.loads((CASE_DIR / "llm_response.json").read_text())
++    extractor = AnthropicExtractor(ReplayModelClient(json.dumps(recorded)))
++
++    report = run_extract(tmp_config, extractor=extractor)
++    assert report.extracted == [DOC_ID]
++    assert report.skipped == []
++
++    expected = _expected()
++    counts = _counts(tmp_config)
++    assert counts["document"] == 1
++    assert counts["entity"] == len(expected["entities"])  # 2 (tsmc_n2, tsmc_n3e)
++    assert counts["claim"] == len(expected["claims"])      # 1
++
++    # Analyze reads the persisted claims back through the report path. The one
++    # relative claim vs a resolved baseline is a singleton -> uncorroborated, and
++    # its member id is doc-scoped by persist_extraction.
++    analysis = run_analysis(tmp_config)
++    assert len(analysis.assessments) == 1
++    a = analysis.assessments[0]
++    assert a.entity_id == "tsmc_n2" and a.metric == "logic_speed"
++    assert a.status == "uncorroborated"
++    assert a.flags == ["single_source"]  # baseline tsmc_n3e is resolved -> no unresolved_baseline
++    assert a.members == [f"{DOC_ID}:tsmc_n2_logic_speed"]
++
++    # Idempotent: a re-run persists nothing new and skips the stored doc.
++    again = run_extract(tmp_config, extractor=extractor)
++    assert again.extracted == []
++    assert again.skipped == [DOC_ID]
++    assert _counts(tmp_config)["document"] == 1
++
++
++def test_run_extract_no_pending_is_a_noop(tmp_config: Config):
++    store.init_db(tmp_config)
++    report = run_extract(tmp_config, extractor=None)  # nothing ingested -> never builds a client
++    assert report.extracted == [] and report.skipped == []
++    assert report.note  # tells the operator to ingest a file
++
++
++@pytest.mark.live
++def test_extract_e2e_live(tmp_path: Path):
++    real = load_config()
++    cfg = Config(
++        model=real.model,
++        paths=PathsConfig(
++            data_dir=tmp_path, raw_dir=tmp_path / "raw", db_path=tmp_path / "semianalyst.db"
++        ),
++        rate_limits=real.rate_limits,
++        sources=(),
++    )
++    store.init_db(cfg)
++    ingest_file(cfg, CASE_DIR / "raw.pdf", **_INGEST_KW)
++
++    report = run_extract(cfg)  # default extractor -> the real Anthropic model
++    assert report.extracted == [DOC_ID]
++    assert _counts(cfg)["claim"] >= 1
++
++
++def test_report_display_is_ansi_sanitized():
++    hostile = "N2\x1b[31mHACK\x1b[0m\x1b]0;pwned\x07 speed"
++    safe = _ansi_safe(hostile)
++    assert "\x1b" not in safe and "\x07" not in safe
++    assert "[31m" not in safe and "0;pwned" not in safe
++    assert "HACK" in safe and "speed" in safe  # payload text survives, but inert

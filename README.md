@@ -5,12 +5,15 @@ A personal CLI pipeline that ingests semiconductor technical releases (foundry n
 ## Quickstart
 
 ```sh
-uv sync                 # install deps into a managed venv
-uv run semianalyst db init      # create the SQLite schema (data/semianalyst.db)
-uv run semianalyst ingest       # fetch the watchlist in config.toml (network fetch WIP)
-uv run semianalyst report       # summarize stored documents / entities / claims
+uv sync                                        # install deps into a managed venv
+uv run semianalyst db init                     # create the SQLite schema (data/semianalyst.db)
+uv run semianalyst ingest-file paper.pdf \     # ingest a local file (operator path; network fetch WIP)
+    --doc-id tsmc_n2 --title "TSMC N2" --publisher TSMC \
+    --doc-type foundry_announcement --source-tier 2 --url https://pr.tsmc.com/...
+uv run semianalyst extract                     # extract grounded claims (needs ANTHROPIC_API_KEY)
+uv run semianalyst report                      # cross-source corroboration + divergence
 ```
 
-`db init` applies the numbered migrations under `src/semianalyst/store/migrations/` and is safe to re-run. `ingest` stores raw docs content-addressed by sha256 under `data/raw/` (idempotent — an unchanged doc is a no-op; a changed one is a new file). `data/` is gitignored. Run the tests with `uv run pytest` (the golden-extraction harness `xfail`s until the LLM extractor lands).
+`db init` applies the numbered migrations under `src/semianalyst/store/migrations/` and is safe to re-run. `ingest-file` stores a local file content-addressed by sha256 under `data/raw/` (idempotent — same bytes are a no-op) and writes a provenance sidecar; `ingest` will fetch the `config.toml` watchlist the same way once network fetch lands (WIP). `extract` reads each ingested raw doc, runs the versioned prompt through the real model, validates + grounds the proposal, and persists claims (idempotent by doc_id + file_sha256; a same-doc_id/changed-bytes revision is surfaced, not silently skipped). `report` derives corroboration on read. `data/` is gitignored. Run the tests with `uv run pytest`: the offline suite replays recorded, provenance-stamped model responses (they *skip* until recorded via `--run-live --record`), and `--run-live` (with `ANTHROPIC_API_KEY`) runs the real extractor — the true gate.
 
-See `CLAUDE.md` for the architectural rules and `schema/extraction_schema_v1.yaml` for the data model (the source of truth).
+See `CLAUDE.md` for the architectural rules, `schema/extraction_schema_v3.yaml` for the data model (the source of truth; `_v1`/`_v2` are retained unedited), and `docs/ROADMAP.md` for current status and priority.

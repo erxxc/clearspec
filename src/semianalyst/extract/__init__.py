@@ -10,6 +10,7 @@ from .base import (
     ModelClient,
     ReplayModelClient,
 )
+from .pipeline import ExtractReport, run_extract
 from .prompts import PromptVersion
 from .validate import (
     ExtractionError,
@@ -24,6 +25,8 @@ __all__ = [
     "AnthropicModelClient",
     "ModelClient",
     "ReplayModelClient",
+    "ExtractReport",
+    "run_extract",
     "PromptVersion",
     "ExtractionError",
     "ExtractionResult",

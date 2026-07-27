@@ -2,7 +2,9 @@
 # Loaded exclusively by src/semianalyst/config.py. Nothing else reads this file.
 
 [model]
-# Extraction model + prompt version. NOT wired up yet — extract/ is a stub this phase.
+# Extraction model + prompt version. Used by `semianalyst extract` (run_extract):
+# reads each ingested raw doc, runs this prompt through the model, validates +
+# grounds the proposal, and persists claims (WS-1, see docs/ROADMAP.md).
 # The API key is read from the ANTHROPIC_API_KEY environment variable, never stored here.
 name = "claude-opus-4-8"
 prompt_version = "extract_foundry_v1"

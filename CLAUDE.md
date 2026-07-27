@@ -63,10 +63,20 @@ but `insert_claim` never writes it and nothing reads it back. Do not re-add a
 persisted per-row verdict without settling the per-group-fact-in-a-per-row-home
 question (decision B2, analyze GATE-2 resolution).
 
-**Hostile-input trust is DEFERRED to the live-ingest workstream (Class A).** The
-current slice runs on curated fixtures — no hostile document can reach
-`persist_extraction`. When live ingest lands, these decisions must be made and
-enforced with a *named adversarial suite* (never the honest acceptance golden):
+**Cross-document TRUST is DEFERRED to the live-ingest workstream (Class A).**
+Nuance corrected at the WS-1 gate (2026-07-27): the prompt-injection SURFACE is
+already live — `run_extract` calls the real model on operator-ingested,
+third-party-authored PDFs (the tool's whole purpose is semi-adversarial vendor
+marketing), so a hostile PDF body reaches the model *in production today*. That
+surface is DEFENDED, not deferred: the `DOC_OPEN`/`DOC_CLOSE` DATA delimiter, the
+`validate.py` per-document grounding (fabricated/exfil claims dropped), and the
+injection tests (`test_injection_wiring_offline` through the real wiring +
+`test_injection_live` against the real model) are the guarantee. Only the network
+FETCH of the bytes is deferred to WS-2. What remains genuinely deferred is
+cross-document TRUST — no single curated/operator-fed document can exercise it,
+and no hostile document can corrupt *cross-document* reconciliation or the
+corroboration verdict yet. When live ingest lands, these decisions must be made
+and enforced with a *named adversarial suite* (never the honest acceptance golden):
 - **K** — does a strictly-higher-trust document ever override a non-null attribute,
   or only race a null one? (current: first-non-null-wins, tier-blind.) This also
   governs `favored_tier`: it currently ships **tier-blind** (`min` over *all*
@@ -83,14 +93,36 @@ enforced with a *named adversarial suite* (never the honest acceptance golden):
   are frozen by the *first* document; a later document's differing values are
   dropped with no signal. A typo'd vendor silently conflates two real things under
   one `entity_id`. No conflict detection built.
+- **Sidecar identity binding** (named at the WS-1 gate) — the ingest sidecar has no
+  invariant tying content identity to document identity. Same doc_id + CHANGED bytes
+  is now surfaced loudly (`run_extract` → `ExtractReport.revised`, never a silent
+  skip), but same-doc_id re-extraction/supersession is deferred. The inverse is
+  unguarded: the SAME bytes re-ingested under a DIFFERENT doc_id last-write-wins the
+  `<sha256>.meta.json` sidecar (`write_sidecar` overwrites), clobbering the first
+  ingest's provenance with no merge or signal — a sibling of Identity-field conflict
+  at the sidecar layer.
+- **Blob content-hash not re-verified at read** — `read_raw_docs` trusts the sidecar
+  FILENAME as the sha256 and never recomputes the blob's hash; the only real hash is
+  computed at `store_raw` write time. Fine for the single-writer operator MVP;
+  matters once WS-2 introduces concurrent/adversarial writers to `data/raw/`.
 - **Baseline content-bound** — post-0003 `cmp_baseline_entity` is unconstrained
   TEXT (the FK drop removed the shape guard too, not just the existence guard). No
   length/byte-content bound on it or on free-text `metric`.
-- **Report display safety** — `cli.py:report()` echoes DB-derived strings
-  (`entity_id`, `aliases`, `metric`, `baseline_entity`) to the terminal with **no
-  output encoding**. Honest fixtures are inert, but once live extraction feeds
-  proposal content here, ANSI/OSC escape sequences render on `semianalyst report`
-  with no code change on the display side. Sanitize output before this ships live.
+- **Report display safety (ANSI/OSC/control escapes)** — RESOLVED 2026-07-27 (WS-1).
+  `cli.py:report()` sanitizes every DB-derived display string (`entity_id`,
+  `aliases`, `metric`, `baseline_entity`) through `cli._ansi_safe`, which strips
+  ANSI/OSC/control-escape sequences (the load rests on the `_CTRL` catch-all; the
+  named OSC/CSI patterns only clean inert printable residue). Terminal output
+  encoding lives at the CLI edge deliberately (a web UI would HTML-escape instead),
+  so it is not a shared library capability. Covered by
+  `test_report_display_is_ansi_sanitized`. **Scope is escapes only** — see the next
+  item for the Unicode half, which is NOT closed.
+- **Report display safety (Unicode spoofing)** — OPEN. `_ansi_safe` does NOT touch
+  Unicode bidirectional-override / zero-width codepoints (U+202A–202E, U+2066–2069,
+  U+200B, U+FEFF): they sit above `\x9f` and render natively in a terminal, so
+  proposal-controlled `metric`/`entity_id`/alias content can still visually reorder
+  or hide text a human reads on `report` (Trojan-Source class) with no escape byte.
+  Inert on honest fixtures today; close it when live extraction feeds `report`.
 - **I/J** — persisted conflict records; slug-collision detection strength.
 `validate.py` enforces a per-DOCUMENT boundary only; cross-document trust is Class A.
 
@@ -105,14 +137,35 @@ Raw docs are keyed by sha256 under `data/raw/`. Re-fetching unchanged bytes is a
 no-op; a changed hash is a new file (this is how silent revisions of the same URL
 are detected — see the schema's `file_sha256`).
 
+## The ingest→extract handoff is a provenance sidecar (decided 2026-07-27, WS-1)
+Each raw blob at `data/raw/<sha256>` has a sidecar `data/raw/<sha256>.meta.json`
+carrying exactly the Document-construction metadata ingest knows (`doc_id`,
+`title`, `publisher`, `doc_type`, `source_tier`, `url`, `publish_date`,
+`ingest_date`, `file_sha256`) — **not** `extraction_model`, which `run_extract`
+stamps at extraction time. **Whatever produces the bytes writes the same sidecar
+shape** — the operator path `ingest.ingest_file` today, WS-2's network fetcher
+later — so `extract` stays fetch-source-agnostic. The `Document` row is created at
+**extract** time (`persist_extraction` inserts it, unchanged), not at ingest.
+`run_extract` classifies each sidecar against `store.stored_doc_shas` (doc_id →
+file_sha256): unknown doc_id → extract; same doc_id + same bytes → idempotent skip;
+same doc_id + CHANGED bytes → a source revision, surfaced loudly in
+`ExtractReport.revised` (never silently skipped) with supersession deferred. Each
+document is fault-isolated — one bad sidecar lands in `ExtractReport.errors` and the
+batch continues. Alternatives considered and rejected for the MVP: a `pending_raw`
+DB table (needless migration; ingest stays DB-free) and an ingest-time Document with
+a status lifecycle (would split the reviewed `persist_extraction` contract). See
+`docs/ROADMAP.md`.
+
 ## Secrets never land in the repo
 The extraction model name lives in `config.toml`; the API key is read from the
 environment (`ANTHROPIC_API_KEY`) at call time and is never committed. `data/` is
 gitignored in full.
 
 ## Module map
-- `ingest/`  — fetchers + content-addressed raw storage (network fetch: WIP)
-- `extract/` — raw doc → schema records via a versioned prompt (LLM: WIP/stub)
+- `ingest/`  — fetchers + content-addressed raw storage + provenance sidecars
+  (`ingest_file` operator path live; network fetch: WIP/WS-2)
+- `extract/` — raw doc → schema records via a versioned prompt; `run_extract` wires
+  ingest (sidecar) → extractor → `persist_extraction`
 - `store/`   — SQLite persistence + entity reconciliation; sole DB owner
 - `analyze/` — cross-source corroboration + divergence (v1: tolerance grouping,
   suspect members excluded from the corroborated count, tier-blind `favored_tier`
