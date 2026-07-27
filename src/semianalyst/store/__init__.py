@@ -16,6 +16,7 @@ from .db import (
     insert_entity,
     reconcile_entity,
     report_counts,
+    stored_doc_shas,
     table_counts,
 )
 from .persist import persist_extraction
@@ -33,5 +34,6 @@ __all__ = [
     "reconcile_entity",
     "persist_extraction",
     "report_counts",
+    "stored_doc_shas",
     "table_counts",
 ]

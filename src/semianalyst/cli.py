@@ -5,9 +5,17 @@ nothing else. Zero business logic lives here. Every command delegates to a
 library entry point that a web UI could call identically. If you find yourself
 writing a loop, a query, or a transformation in this file, it belongs in a
 library module instead.
+
+The one thing that DOES live here is terminal output encoding (`_ansi_safe`):
+sanitizing DB-derived strings against ANSI/OSC escapes is a display-edge concern
+specific to a terminal sink — a web UI would HTML-escape the same values instead,
+so it is not a shared library capability. It guards the day live extraction feeds
+proposal-controlled strings (metric, baseline_entity, aliases) into `report`.
 """
 
 from __future__ import annotations
+
+import re
 
 import typer
 
@@ -15,7 +23,7 @@ from . import store
 from .analyze import run_analysis
 from .config import load_config
 from .extract.pipeline import run_extract
-from .ingest.pipeline import run_ingest
+from .ingest.pipeline import ingest_file, run_ingest
 
 app = typer.Typer(
     help="semianalyst — ingest semiconductor releases and extract quantitative claims.",
@@ -25,6 +33,21 @@ app = typer.Typer(
 
 db_app = typer.Typer(help="Database management.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+
+# ANSI/OSC + control-char stripping for untrusted, DB-derived display strings.
+# OSC (ESC ] ... BEL/ST) first, then CSI/other ESC sequences, then any residual
+# control bytes (bare ESC and the C1 CSI introducer 0x9b) so a partial sequence
+# can't survive as a live escape.
+_ANSI_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_ANSI_CSI = re.compile(r"\x1b[@-_][0-?]*[ -/]*[@-~]")
+_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _ansi_safe(text: str) -> str:
+    """Neutralize terminal escape sequences in an untrusted display string."""
+    text = _ANSI_OSC.sub("", text)
+    text = _ANSI_CSI.sub("", text)
+    return _CTRL.sub("", text)
 
 
 @db_app.command("init")
@@ -48,14 +71,41 @@ def ingest() -> None:
         typer.echo(f"  skipped: {name}")
 
 
+@app.command("ingest-file")
+def ingest_file_cmd(
+    path: str = typer.Argument(..., help="Local file to ingest (e.g. a PDF)."),
+    doc_id: str = typer.Option(..., help="Stable id for this document."),
+    title: str = typer.Option(...),
+    publisher: str = typer.Option(...),
+    doc_type: str = typer.Option(..., help="Schema DocType, e.g. foundry_announcement."),
+    source_tier: int = typer.Option(..., help="1=conference, 2=foundry, 3=vendor."),
+    url: str = typer.Option(...),
+    publish_date: str = typer.Option(None, help="ISO date the source was published."),
+) -> None:
+    """Ingest a local file (content-addressed) and write its provenance sidecar."""
+    raw = ingest_file(
+        load_config(), path, doc_id=doc_id, title=title, publisher=publisher,
+        doc_type=doc_type, source_tier=source_tier, url=url, publish_date=publish_date,
+    )
+    typer.echo(f"ingested {raw.sha256[:12]}  doc_id={_ansi_safe(raw.meta['doc_id'])}")
+
+
 @app.command()
 def extract() -> None:
     """Extract claims from ingested raw docs into the canonical schema."""
-    try:
-        run_extract(load_config())
-    except NotImplementedError as exc:
-        typer.echo(str(exc))
-        raise typer.Exit(code=1)
+    report = run_extract(load_config())
+    if report.note:
+        typer.echo(report.note)
+    typer.echo(
+        f"extracted: {len(report.extracted)}  skipped: {len(report.skipped)}  "
+        f"revised: {len(report.revised)}  errors: {len(report.errors)}"
+    )
+    for doc_id in report.extracted:
+        typer.echo(f"  extracted: {_ansi_safe(doc_id)}")
+    for doc_id in report.revised:  # loud: a source revision was NOT extracted
+        typer.echo(f"  REVISION (not extracted): {_ansi_safe(doc_id)}")
+    for doc_id, reason in report.errors:
+        typer.echo(f"  ERROR {_ansi_safe(doc_id)}: {_ansi_safe(reason)}")
 
 
 @app.command()
@@ -66,11 +116,12 @@ def report() -> None:
         typer.echo("no claims in the store — nothing to corroborate yet.")
         return
     for entity_id, info in analysis.entities_reconciled.items():
-        typer.echo(f"{entity_id}  aliases={info['aliases']}")
+        aliases = [_ansi_safe(a) for a in info["aliases"]]
+        typer.echo(f"{_ansi_safe(entity_id)}  aliases={aliases}")
     for a in analysis.assessments:
-        line = f"  [{a.status}] {a.metric}"
+        line = f"  [{a.status}] {_ansi_safe(a.metric)}"
         if a.baseline_entity:
-            line += f" vs {a.baseline_entity}"
+            line += f" vs {_ansi_safe(a.baseline_entity)}"
         line += f"  range={a.value_range} tiers={a.tiers} confidence={a.confidence}"
         if a.flags:
             line += f" flags={a.flags}"

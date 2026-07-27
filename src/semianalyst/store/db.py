@@ -176,6 +176,20 @@ def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
     return {t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"] for t in tables}
 
 
+def stored_doc_shas(conn: sqlite3.Connection) -> dict[str, str]:
+    """doc_id -> file_sha256 for every persisted Document. `run_extract` uses this
+    to classify each ingested sidecar: an unknown doc_id is pending; the same
+    doc_id AND the same file_sha256 is already extracted (an honest idempotent
+    skip); the same doc_id with a DIFFERENT file_sha256 is a silent source revision
+    (the schema's `file_sha256` exists precisely to detect this) — surfaced loudly,
+    never skipped. Same-doc_id re-extraction/supersession is deferred (see
+    CLAUDE.md); the guarantee here is that a revision is never silently dropped."""
+    return {
+        row["doc_id"]: row["file_sha256"]
+        for row in conn.execute("SELECT doc_id, file_sha256 FROM document")
+    }
+
+
 from dataclasses import dataclass
 
 
