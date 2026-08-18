@@ -127,6 +127,48 @@ def test_rebuild_reproduces_the_incremental_store(tmp_config: Config):
 
 
 # --------------------------------------------------------------------------
+# Determinism of CONFLICT records: incremental == rebuilt (WS-2a, Conflict 1 —
+# conflicts are a function of the fold, regenerated identically on refold)
+# --------------------------------------------------------------------------
+def _conflict_keys(config: Config) -> list[tuple]:
+    """Deterministic conflict identity — created_at/conflict_id are store-stamped
+    wall clock + autoincrement, not content, so they don't survive a refold."""
+    conn = store.connect(config.paths.db_path)
+    try:
+        return [(c.kind.value, c.entity_id, c.doc_id, c.field, c.stored_value, c.offered_value)
+                for c in store.get_conflicts(conn)]
+    finally:
+        conn.close()
+
+
+def test_conflicts_regenerate_deterministically_on_rebuild(tmp_config: Config, tmp_path: Path):
+    store.init_db(tmp_config)
+    ingest_file(tmp_config, CASE_DIR / "raw.pdf", **_INGEST_KW)
+    assert run_extract(tmp_config, extractor=_replay(CASE_DIR, "llm_response.json")).extracted == [DOC_ID]
+
+    # A second, independent document (its own doc_id AND bytes) re-describing
+    # tsmc_n2 with a DIFFERENT transistor_type — the quote_span is unchanged, so
+    # the attribute stays grounded and the disagreement reaches reconcile, which
+    # refuses it and records an attribute conflict naming the second doc.
+    other_pdf = tmp_path / "other.pdf"
+    other_pdf.write_bytes((CASE_DIR / "raw.pdf").read_bytes() + b"%% second source\n")
+    ingest_file(tmp_config, other_pdf, **{**_INGEST_KW, "doc_id": "tsmc_n2_2026",
+                "url": "https://example.test/tsmc_n2_2026", "ingest_date": "2026-01-02"})
+    proposal = json.loads((CASE_DIR / "llm_response.json").read_text())
+    proposal["entities"][0]["node"]["transistor_type"] = "cfet"
+    rep = run_extract(tmp_config, extractor=AnthropicExtractor(ReplayModelClient(json.dumps(proposal))))
+    assert rep.extracted == ["tsmc_n2_2026"] and rep.errors == []
+
+    incremental = _conflict_keys(tmp_config)
+    assert incremental == [
+        ("attribute", "tsmc_n2", "tsmc_n2_2026", "node.transistor_type", "gaa_nanosheet", "cfet")]
+
+    fold = run_rebuild(tmp_config)
+    assert sorted(fold.folded) == [DOC_ID, "tsmc_n2_2026"] and fold.errors == []
+    assert _conflict_keys(tmp_config) == incremental  # regenerated, not carried over
+
+
+# --------------------------------------------------------------------------
 # Revision E2E: extract v1 -> re-ingest changed bytes -> only the revision persists
 # --------------------------------------------------------------------------
 def test_revision_supersedes_prior_extraction(tmp_config: Config, tmp_path: Path):
