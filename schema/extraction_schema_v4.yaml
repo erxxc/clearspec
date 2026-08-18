@@ -1,0 +1,89 @@
+# Semiconductor Technical Release — Extraction Schema v4
+# Supersedes v3 (schema/extraction_schema_v3.yaml), which is retained unedited.
+#
+# What changed from v3 (WS-2 live-ingest plan gate, 2026-08-18 — see
+# docs/reviews/2026-08-18-live-ingest-plan/resolution.md, which is authoritative
+# for every decision below):
+#
+#   * NEW record: `conflict` — a persisted, per-EVENT fact written by store
+#     reconciliation whenever a later document differs from stored state in a way
+#     the store refuses to apply (never-overwrite is universal; no tier ever
+#     auto-resolves). Persisted rather than derive-on-read because the offered
+#     value is otherwise LOST — reconcile drops it, so there is nothing to
+#     re-derive from (unlike the per-group corroboration verdict, decision B2,
+#     which analyze recomputes from surviving rows). Conflict values are
+#     adversary-authored text built to be read by a human: they are BOUNDED
+#     (<=120) at every layer and MUST pass through the display sanitizer
+#     (ANSI/OSC + Unicode Cf) at every display site.
+#   * CONTENT BOUNDS on every model- or network-influenced string field
+#     (lengths below). Enforcement is two-layer: pydantic carries length AND
+#     charset/pattern constraints (the shape guard); the SQLite DDL mirrors the
+#     LENGTH bounds as CHECK constraints (the durable flood guard — migration
+#     0004 recreates document/entity/claim with them). Charset patterns are
+#     deliberately pydantic-only: SQLite has no honest regex CHECK, and a
+#     length-bounded, pydantic-shaped value is the contract.
+#   * PROVENANCE artifact (filesystem, not a DB table): each extraction run
+#     persists its validated result as `data/raw/<file_sha256>.extraction.json`
+#     beside the raw blob. The DB is a deterministic FOLD over retained
+#     artifacts (replaying persist_extraction); `forget <doc_id>` quarantines an
+#     artifact + sidecar and refolds; a revision (same doc_id, new bytes)
+#     supersedes on refold — latest artifact per doc_id wins by ingest_date,
+#     tie-broken by file_sha256. This is ingest/extract's concern (like raw
+#     blobs), documented here because it is what makes the store retractable.
+#
+# ---------------------------------------------------------------
+# CONFLICT — persisted reconciliation-refusal record (v4, NEW)
+# ---------------------------------------------------------------
+conflict:
+  conflict_id: int            # surrogate (AUTOINCREMENT)
+  kind: enum                  # [identity_field, attribute, alias_collision]
+                              #   identity_field: later doc differs on frozen
+                              #     vendor/name/entity_type (first writer wins,
+                              #     difference recorded — never silently dropped)
+                              #   attribute: later doc differs on a non-null
+                              #     node/chip attribute (K1/K2: never overwritten)
+                              #   alias_collision: incoming alias equals another
+                              #     stored entity's name/alias (G3: not unioned)
+  entity_id: ref              # the entity the write targeted (FK)
+  doc_id: ref                 # the OFFENDING document (FK)
+  field: str                  # <=80 — identity field name, attribute path, or 'alias'
+  stored_value: str|null      # <=120 — what the store already held (null for alias_collision)
+  offered_value: str          # <=120 — what the document tried to write. ADVERSARY
+                              #   TEXT: display only through the hardened sanitizer.
+  created_at: str             # ISO timestamp
+
+# ---------------------------------------------------------------
+# CONTENT BOUNDS (v4) — lengths mirrored into DDL CHECKs (migration 0004);
+# charset/pattern enforced in pydantic (store/models.py).
+# ---------------------------------------------------------------
+bounds:
+  document:
+    doc_id: {max: 120, pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$"}
+    title: {max: 300, no_control_chars: true}
+    publisher: {max: 120, no_control_chars: true}
+    url: {max: 2000, no_control_chars: true}
+    file_sha256: {pattern: "^[a-f0-9]{64}$"}
+    extraction_model: {max: 200, no_control_chars: true}
+  entity:
+    entity_id: {max: 80, pattern: "^[a-z0-9_]{1,80}$"}
+    vendor: {max: 80, no_control_chars: true}
+    name: {max: 80, no_control_chars: true}
+    aliases: {max_items: 16, item_max: 80, no_control_chars: true}
+  claim:
+    claim_id: {max: 200, pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"}
+    metric: {max: 120, no_control_chars: true}
+    unit: {max: 16, no_control_chars: true}
+    cmp_baseline_entity: {max: 80, pattern: "^[a-z0-9_]{1,80}$", nullable: true}
+    cond_workload: {max: 120, no_control_chars: true}
+    cond_precision: {max: 120, no_control_chars: true}
+    cond_thermal_config: {max: 120, no_control_chars: true}
+    cond_stated_caveats: {max_items: 16, item_max: 500}   # verbatim footnotes — length only
+    cite_quote_span: {max: 2000}                          # verbatim source — length only
+  conflict:
+    field: {max: 80}
+    stored_value: {max: 120}
+    offered_value: {max: 120}
+
+# All other blocks (document, citation, entity, claim, corroboration,
+# macro_snapshot, normalization rules) are unchanged from
+# extraction_schema_v3.yaml / _v2.yaml.
