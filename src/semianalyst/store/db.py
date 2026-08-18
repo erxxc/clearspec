@@ -404,6 +404,22 @@ def get_entities_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
     }
 
 
+def get_entities_for_analysis(conn: sqlite3.Connection) -> list[dict]:
+    """Read-only identity projection for analyze's advisory checks (J slug
+    collisions): entity_id, entity_type, vendor, name, aliases (decoded)."""
+    return [
+        {
+            "entity_id": r["entity_id"], "entity_type": r["entity_type"],
+            "vendor": r["vendor"], "name": r["name"],
+            "aliases": json.loads(r["aliases"]),
+        }
+        for r in conn.execute(
+            "SELECT entity_id, entity_type, vendor, name, aliases FROM entity "
+            "ORDER BY entity_id"
+        )
+    ]
+
+
 def get_claims_for_analysis(conn: sqlite3.Connection) -> list[ClaimView]:
     """Every claim, joined to its document's source_tier and publisher."""
     rows = conn.execute(

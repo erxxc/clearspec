@@ -16,6 +16,7 @@ proposal-controlled strings (metric, baseline_entity, aliases) into `report`.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 import typer
 
@@ -44,10 +45,16 @@ _CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def _ansi_safe(text: str) -> str:
-    """Neutralize terminal escape sequences in an untrusted display string."""
+    """Neutralize terminal escape sequences AND Unicode format characters in an
+    untrusted display string. The Cf pass (2026-08-18 gate, §2.8) is a CATEGORY
+    test, not an enumerated list: bidi overrides (U+202A-202E, U+2066-2069),
+    zero-widths (U+200B..200D), and BOM (U+FEFF) all sit above \\x9f and render
+    natively — the Trojan-Source class — and any future format codepoint fails
+    safe by category."""
     text = _ANSI_OSC.sub("", text)
     text = _ANSI_CSI.sub("", text)
-    return _CTRL.sub("", text)
+    text = _CTRL.sub("", text)
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
 
 
 @db_app.command("init")
@@ -158,6 +165,18 @@ def report() -> None:
         if a.flags:
             line += f" flags={a.flags}"
         typer.echo(line)
+    if analysis.conflicts:
+        # The conflict record exists to be read by a human — which makes
+        # offered/stored values the highest-incentive display payload in the
+        # store (gate injection F3). Every field goes through _ansi_safe.
+        typer.echo(f"conflicts: {len(analysis.conflicts)}")
+        for c in analysis.conflicts:
+            stored = _ansi_safe(c.stored_value) if c.stored_value is not None else "-"
+            typer.echo(
+                f"  [{_ansi_safe(c.kind.value)}] {_ansi_safe(c.entity_id)}"
+                f" <- {_ansi_safe(c.doc_id)}  {_ansi_safe(c.field)}:"
+                f" {stored} -> {_ansi_safe(c.offered_value)}"
+            )
 
 
 if __name__ == "__main__":
