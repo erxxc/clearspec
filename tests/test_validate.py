@@ -258,6 +258,69 @@ def test_shape_invalid_claim_is_dropped_not_fatal():
     assert any(r.kind == "claim" and r.target == "bad" and "shape invalid" in r.reason for r in rej)
 
 
+def test_sparse_vocab_in_span_forces_sparsity():
+    """A grounded quote_span carrying sparse-benchmark vocabulary overrides the
+    model's self-declaration (2026-08-18 gate, injection F1 — live bug): a hostile
+    doc can steer the model to omit/deny sparsity, but not to remove the words."""
+    src = "Delivers 2x throughput with 2:4 structured sparsity enabled."
+    for declared in (None, False):  # omitted AND actively denied both get forced
+        c = _claim(citation={"quote_span": src, "location_type": "body"})
+        c["conditions"] = {"stated_caveats": [], "sparsity": declared}
+        result, rej = validate_proposal({"entities": [_entity()], "claims": [c]}, src)
+        assert result.claims[0].conditions.sparsity is True
+        assert any(r.kind == "claim_condition" for r in rej)
+
+
+def test_sparse_vocab_elsewhere_in_doc_does_not_force():
+    """Only the claim's own quote_span counts — vocabulary elsewhere in the
+    document does not implicate an unrelated claim."""
+    src = "Sparsity is used in another section. The chip reaches 40 GB/s."
+    c = _claim(citation={"quote_span": "The chip reaches 40 GB/s.", "location_type": "body"},
+               value=40.0, unit="GB/s",
+               comparison={"is_relative": False, "baseline_entity": None, "baseline_stated": False})
+    result, _ = validate_proposal({"entities": [_entity()], "claims": [c]}, src)
+    assert result.claims[0].conditions.sparsity is None
+
+
+def test_sparse_vocab_regex_does_not_match_clock_times():
+    src = "Measured at 12:45 on the reference platform, 40 GB/s."
+    c = _claim(citation={"quote_span": src, "location_type": "body"},
+               value=40.0, unit="GB/s",
+               comparison={"is_relative": False, "baseline_entity": None, "baseline_stated": False})
+    result, _ = validate_proposal({"entities": [_entity()], "claims": [c]}, src)
+    assert result.claims[0].conditions.sparsity is None
+
+
+def test_forced_sparsity_feeds_marketing_only():
+    """The forcing runs BEFORE the marketing_only check: an undisclosed-sparsity
+    cross-vendor comparison whose span says 'sparse' lands marketing_only."""
+    src = "3x faster than CompetitorX with structured sparsity."
+    a = _entity("e", vendor="V", name="N")
+    b = _entity("bx", vendor="W", name="X")
+    c = _claim(citation={"quote_span": src, "location_type": "body"},
+               comparison={"is_relative": True, "baseline_entity": "bx", "baseline_stated": True})
+    result, _ = validate_proposal({"entities": [a, b], "claims": [c]}, src)
+    kept = result.claims[0]
+    assert kept.conditions.sparsity is True
+    assert kept.completeness.value == "marketing_only"
+
+
+def test_vendor_casing_dedup_merges_within_one_document():
+    """One document's 'TSMC'/'Tsmc' is one vendor — two casings must not mint two
+    entities (2026-08-18 gate, schema-purist risk)."""
+    p = {"entities": [
+        {"entity_id": "tsmc_n2", "entity_type": "process_node", "vendor": "TSMC", "name": "N2",
+         "aliases": [], "node": None, "chip": None, "attribute_citations": {}},
+        {"entity_id": "tsmc_n2_alt", "entity_type": "process_node", "vendor": "Tsmc", "name": "N2",
+         "aliases": ["2nm"], "node": None, "chip": None, "attribute_citations": {}}],
+        "claims": []}
+    result, rej = validate_proposal(p, "N2 stuff.")
+    assert len(result.entities) == 1
+    assert result.entities[0].vendor == "TSMC"  # first writer's casing survives
+    assert result.entities[0].aliases == ["N2", "2nm"]
+    assert any(r.kind == "entity_merge" for r in rej)
+
+
 def test_entity_dedup_merges_by_vendor_and_name():
     src = "N2 stuff."
     p = {"entities": [
