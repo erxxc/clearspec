@@ -13,7 +13,7 @@ Keep this file honest on every workstream boundary: when a slice lands, move its
 row from *Open* to *Built*; when a Class A item is retired, strike it here and in
 CLAUDE.md in the same commit.
 
-_Last updated: 2026-07-27._
+_Last updated: 2026-08-18._
 
 ---
 
@@ -27,14 +27,14 @@ _Last updated: 2026-07-27._
 | `store/` persist + reconcile | **BUILT + in prod** | now invoked by `run_extract`; `stored_doc_shas` drives idempotency. |
 | `analyze/` corroboration | **BUILT + tested** | Derive-on-read, tolerance grouping, tier-blind `favored_tier`. |
 
-Offline suite (2026-07-27, post-WS-1 gate): **55 passed, 3 skipped** (the 3 skips
-are the `@live` golden, injection, and E2E). Branch: `feat/extract-wiring` (off `main`).
+Offline suite (2026-08-18, re-verified on `main`): **55 passed, 3 skipped** (the 3
+skips are the `@live` golden, injection, and E2E). WS-1 merged to `main` via PR #2.
 
 ---
 
 ## Prioritized workstreams
 
-### WS-1 — Wire `run_extract` (extract E2E on operator-fed raw docs) — **READY TO COMMIT (gate passed 2026-07-27, conditions applied)**
+### WS-1 — Wire `run_extract` (extract E2E on operator-fed raw docs) — **BUILT & MERGED (PR #2; gate passed 2026-07-27, conditions applied)**
 
 Turns three built components (extractor, persist, analyze) into a working
 pipeline with **zero network**. Operator hand-feeds a curated PDF → `extract` →
