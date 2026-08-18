@@ -27,8 +27,13 @@ _Last updated: 2026-08-18._
 | `store/` persist + reconcile | **BUILT + in prod** | now invoked by `run_extract`; `stored_doc_shas` drives idempotency. |
 | `analyze/` corroboration | **BUILT + tested** | Derive-on-read, tolerance grouping, tier-blind `favored_tier`. |
 
-Offline suite (2026-08-18, re-verified on `main`): **55 passed, 3 skipped** (the 3
+Offline suite (2026-08-18, re-verified on `main`): **57 passed, 3 skipped** (the 3
 skips are the `@live` golden, injection, and E2E). WS-1 merged to `main` via PR #2.
+**Live anchor re-proven 2026-08-18: full `--run-live` suite 60 passed, 0 skipped.**
+The live golden had grown flaky (~4/5 failing): the model includes the entity's
+canonical name in `aliases` inconsistently. Fixed by pinning `name` into `aliases`
+in `extract/validate.py` (validation is the guarantee, not the prompt); 25+
+consecutive clean live runs after the fix.
 
 ---
 
