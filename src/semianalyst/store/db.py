@@ -302,6 +302,18 @@ def _conflict_repr(value: object) -> str:
     return str(value)[:120]
 
 
+def _foreign_surface_forms(conn: sqlite3.Connection, entity_id: str) -> set[str]:
+    """Every OTHER entity's surface forms (name + aliases), case-folded — one
+    query; the store is small enough that a full scan per reconcile is fine."""
+    foreign: set[str] = set()
+    for row in conn.execute(
+        "SELECT name, aliases FROM entity WHERE entity_id != ?", (entity_id,)
+    ):
+        foreign.add(row["name"].casefold())
+        foreign.update(a.casefold() for a in json.loads(row["aliases"]))
+    return foreign
+
+
 def _refusal(
     kind: models.ConflictKind, entity_id: str, doc_id: str, field: str,
     stored: object | None, offered: object,
@@ -329,12 +341,33 @@ def reconcile_entity(conn: sqlite3.Connection, ent: models.Entity, doc_id: str) 
         a differing non-null value is recorded as `attribute` under its schema
         path (e.g. 'node.transistor_type'); an equal re-offer is a no-op;
       - aliases (G3): unioned, EXCEPT an alias that equals (case-insensitive)
-        ANOTHER stored entity's name or alias — refused as `alias_collision`, so
-        a later doc cannot capture a competitor's surface form at merge time.
+        ANOTHER stored entity's name or alias — refused as `alias_collision`.
+        This applies on BOTH paths — merge AND first insert — so neither a later
+        doc nor a freshly minted entity can capture a competitor's surface form
+        (the entity's own shape-validated name is exempt on insert).
     """
     existing = conn.execute("SELECT * FROM entity WHERE entity_id = ?", (ent.entity_id,)).fetchone()
     if existing is None:
-        insert_entity(conn, ent)
+        # G3 applies to the INSERT path too (hostile-suite finding, 2026-08-18):
+        # a NEW entity must not capture another entity's surface form as an
+        # alias any more than a merge may. The entity's OWN shape-validated
+        # `name` is exempt (the pinned-name invariant — an identity-level
+        # name squat is the J/identity domain, not alias filtering). Refused
+        # aliases become alias_collision conflicts AFTER the insert (the
+        # conflict row FK-references the entity).
+        foreign = _foreign_surface_forms(conn, ent.entity_id)
+        kept: list[str] = []
+        refused: list[str] = []
+        for alias in ent.aliases:
+            if alias.casefold() != ent.name.casefold() and alias.casefold() in foreign:
+                refused.append(alias)
+            else:
+                kept.append(alias)
+        insert_entity(conn, ent.model_copy(update={"aliases": kept}))
+        for alias in refused:
+            insert_conflict(conn, _refusal(
+                models.ConflictKind.alias_collision, ent.entity_id, doc_id,
+                "alias", None, alias))
         return
 
     # --- identity fields: compare case-folded; first writer wins (K1) ---
@@ -373,14 +406,7 @@ def reconcile_entity(conn: sqlite3.Connection, ent: models.Entity, doc_id: str) 
     # --- aliases: union, refusing cross-entity collisions (G3) ---
     aliases = json.loads(existing["aliases"])
     if ent.aliases:
-        # Every OTHER entity's surface forms, case-folded — one query; the store
-        # is small enough that a full scan per reconcile is fine.
-        foreign: set[str] = set()
-        for row in conn.execute(
-            "SELECT name, aliases FROM entity WHERE entity_id != ?", (ent.entity_id,)
-        ):
-            foreign.add(row["name"].casefold())
-            foreign.update(a.casefold() for a in json.loads(row["aliases"]))
+        foreign = _foreign_surface_forms(conn, ent.entity_id)
         for alias in ent.aliases:
             if alias in aliases:
                 continue  # already unioned — an equal re-offer, not a conflict

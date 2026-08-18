@@ -145,12 +145,9 @@ def test_alias_graft(tmp_config: Config):
     is refused, an alias_collision conflict names the offender, and no alias
     list ends up bridging the two identities.
 
-    KNOWN RESIDUAL (found building this suite, 2026-08-18; not a named case):
-    G3 guards the MERGE path only. A hostile doc that mints a NEW entity_id
-    (different vendor, so J's same-vendor pairing never fires) can still store a
-    competitor's surface form in its alias list with no refusal, no conflict,
-    and no flag — inert today (grouping is by entity_id), but it pre-plants the
-    capture for any future alias-based resolution."""
+    (The new-entity variant of this attack — G3 originally guarded the merge
+    path only — was found building this suite and closed at integration; see
+    test_alias_graft_via_new_entity.)"""
     conn = _conn(tmp_config)
     try:
         # Honest doc: creates both real things — TSMC N2 and the competitor Intel 18A.
@@ -182,6 +179,38 @@ def test_alias_graft(tmp_config: Config):
         assert _conflict_keys(conn) == [
             ("alias_collision", "tsmc_n2", "d2", "alias", None, "18A")]
         assert store.conflict_counts_by_entity(conn) == {"tsmc_n2": 1}
+    finally:
+        conn.close()
+
+
+def test_alias_graft_via_new_entity(tmp_config: Config):
+    """ATTACK (the insert-path variant, found by this suite): a hostile doc mints
+    a NEW entity_id under a DIFFERENT vendor — so J's same-vendor pairing never
+    fires — and lists the competitor's name among its aliases. G3 must apply on
+    first insert exactly as on merge: the colliding alias is refused with an
+    alias_collision conflict; the entity's own pinned name is exempt (it is the
+    shape-validated identity field — a name-level squat is the J/identity
+    domain, not alias filtering)."""
+    conn = _conn(tmp_config)
+    try:
+        src1 = "TSMC N2 enters production."
+        _persist_validated(conn, _doc("d1", publisher="TSMC", tier=2), {
+            "entities": [_pe("tsmc_n2", "TSMC", "N2", entity_type="process_node")],
+            "claims": [],
+        }, src1)
+
+        src2 = "Rival RN2 outclasses N2 in raw speed."
+        _persist_validated(conn, _doc("d2", publisher="Rival Labs", tier=3), {
+            "entities": [_pe("rival_rn2", "Rival", "RN2", entity_type="process_node",
+                             aliases=["N2"])],
+            "claims": [],
+        }, src2)
+        conn.commit()
+
+        assert _aliases(conn, "rival_rn2") == ["RN2"]       # own pinned name only
+        assert _aliases(conn, "tsmc_n2") == ["N2"]          # competitor unpolluted
+        assert _conflict_keys(conn) == [
+            ("alias_collision", "rival_rn2", "d2", "alias", None, "N2")]
     finally:
         conn.close()
 
