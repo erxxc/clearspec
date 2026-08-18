@@ -88,7 +88,13 @@ from the Class A list here + in CLAUDE.md.
   injection-live-in-WS-1 framing + add a wiring injection test) and applied; per-doc
   fault isolation added. Gate outcome: **proceed**.
 
-### WS-2 — Live ingest (network fetch) + Class A trust model — **PLAN GATE PASSED (2026-08-18, proceed-with-conditions)**
+### WS-2 — Live ingest (network fetch) + Class A trust model — **WS-2a BUILT (this branch, precommit gate pending); WS-2b NEXT**
+
+Status 2026-08-18: step 1 (sparsity grounding + vendor case-fold) merged-ready as
+its own PR; step 2 (WS-2a trust hardening, everything below) built on
+`feat/ws2a-trust` with the hostile suite + honest-corpus regression + flag
+budget; step 3 (WS-2b fetcher) not started. CLAUDE.md's Class A section now
+records the resolved set; the deferred items keep their named triggers.
 
 Trust-model design gate run at `docs/reviews/2026-08-18-live-ingest-plan/`
 (3× conditional + devils-advocate challenge; four forks adjudicated by the
