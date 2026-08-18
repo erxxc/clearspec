@@ -24,6 +24,7 @@ from . import store
 from .analyze import run_analysis
 from .config import load_config
 from .extract.pipeline import run_extract, run_rebuild
+from .ingest import SidecarCollision
 from .ingest.pipeline import forget, ingest_file, run_ingest
 
 app = typer.Typer(
@@ -90,17 +91,27 @@ def ingest_file_cmd(
     publish_date: str = typer.Option(None, help="ISO date the source was published."),
 ) -> None:
     """Ingest a local file (content-addressed) and write its provenance sidecar."""
-    raw = ingest_file(
-        load_config(), path, doc_id=doc_id, title=title, publisher=publisher,
-        doc_type=doc_type, source_tier=source_tier, url=url, publish_date=publish_date,
-    )
-    typer.echo(f"ingested {raw.sha256[:12]}  doc_id={_ansi_safe(raw.meta['doc_id'])}")
+    try:
+        raw = ingest_file(
+            load_config(), path, doc_id=doc_id, title=title, publisher=publisher,
+            doc_type=doc_type, source_tier=source_tier, url=url, publish_date=publish_date,
+        )
+    except SidecarCollision as exc:
+        # An expected refusal, not a crash — no traceback (UAT A1).
+        typer.echo(f"refused: {_ansi_safe(str(exc))}", err=True)
+        raise typer.Exit(1) from exc
+    suffix = "" if raw.is_new else "  (identical bytes already ingested — no-op)"
+    typer.echo(f"ingested {raw.sha256[:12]}  doc_id={_ansi_safe(raw.meta['doc_id'])}{suffix}")
 
 
 @app.command()
 def extract() -> None:
     """Extract claims from ingested raw docs into the canonical schema."""
-    report = run_extract(load_config())
+    try:
+        report = run_extract(load_config())
+    except store.StoreNotInitialized as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
     if report.note:
         typer.echo(report.note)
     typer.echo(
@@ -121,7 +132,12 @@ def forget_cmd(
 ) -> None:
     """Retract a document: quarantine its sidecar(s) + extraction artifact(s) under
     data/quarantine/ and rebuild the store without it. Raw blobs are retained."""
-    report = forget(load_config(), doc_id)
+    try:
+        report = forget(load_config(), doc_id)
+    except ValueError as exc:
+        # Unknown doc_id — an expected refusal, not a crash (UAT A1).
+        typer.echo(f"refused: {_ansi_safe(str(exc))}", err=True)
+        raise typer.Exit(1) from exc
     typer.echo(f"quarantined: {len(report.quarantined)} file(s) for doc_id={_ansi_safe(report.doc_id)}")
     for name in report.quarantined:
         typer.echo(f"  quarantined: {_ansi_safe(name)}")
@@ -150,7 +166,11 @@ def db_rebuild() -> None:
 @app.command()
 def report() -> None:
     """Print cross-source corroboration and divergence per entity + metric."""
-    analysis = run_analysis(load_config())
+    try:
+        analysis = run_analysis(load_config())
+    except store.StoreNotInitialized as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
     if not analysis.assessments:
         typer.echo("no claims in the store — nothing to corroborate yet.")
         return
@@ -171,11 +191,16 @@ def report() -> None:
         # store (gate injection F3). Every field goes through _ansi_safe.
         typer.echo(f"conflicts: {len(analysis.conflicts)}")
         for c in analysis.conflicts:
-            stored = _ansi_safe(c.stored_value) if c.stored_value is not None else "-"
+            # Wording is refusal semantics (UAT C2): the store KEPT the stored
+            # value and REFUSED the offer — never "stored -> offered", which
+            # reads like an applied mutation.
+            what = (f"kept {_ansi_safe(c.stored_value)}, refused {_ansi_safe(c.offered_value)}"
+                    if c.stored_value is not None
+                    else f"refused {_ansi_safe(c.offered_value)}")
             typer.echo(
                 f"  [{_ansi_safe(c.kind.value)}] {_ansi_safe(c.entity_id)}"
-                f" <- {_ansi_safe(c.doc_id)}  {_ansi_safe(c.field)}:"
-                f" {stored} -> {_ansi_safe(c.offered_value)}"
+                f"  {_ansi_safe(c.field)}: {what}"
+                f" from {_ansi_safe(c.doc_id)}"
             )
 
 

@@ -95,7 +95,7 @@ def ingest_file(
         "file_sha256": raw.sha256,
     }
     write_sidecar(config.paths.raw_dir, raw.sha256, meta)
-    return RawDoc(sha256=raw.sha256, blob_path=raw.path, meta=meta)
+    return RawDoc(sha256=raw.sha256, blob_path=raw.path, meta=meta, is_new=raw.is_new)
 
 
 def _quarantine_dest(quarantine_dir: Path, name: str) -> Path:

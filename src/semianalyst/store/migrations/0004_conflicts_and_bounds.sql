@@ -60,7 +60,8 @@ CREATE TABLE entity_v4 (
     node_backside_power   INTEGER,
     node_hvm_date_claimed TEXT,
     node_hvm_date_actual  TEXT,
-    chip_process_node_ref TEXT REFERENCES entity(entity_id),
+    chip_process_node_ref TEXT REFERENCES entity(entity_id)
+                            CHECK (chip_process_node_ref IS NULL OR length(chip_process_node_ref) <= 80),
     chip_transistor_count_b REAL,
     chip_die_size_mm2     REAL,
     chip_package_type     TEXT CHECK (chip_package_type IS NULL OR length(chip_package_type) <= 120),

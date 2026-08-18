@@ -7,6 +7,7 @@ No other package should import `sqlite3` or write SQL.
 from . import models
 from .db import (
     ClaimView,
+    StoreNotInitialized,
     conflict_counts_by_entity,
     connect,
     get_claims_for_analysis,
@@ -28,6 +29,7 @@ from .persist import persist_extraction
 __all__ = [
     "models",
     "ClaimView",
+    "StoreNotInitialized",
     "conflict_counts_by_entity",
     "connect",
     "get_claims_for_analysis",

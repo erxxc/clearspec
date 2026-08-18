@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -192,8 +193,11 @@ def insert_conflict(conn: sqlite3.Connection, conflict: models.Conflict) -> None
 # Read helpers (used by analyze/ and the `report` command)
 # --------------------------------------------------------------------------
 def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    tables = ("document", "entity", "claim", "macro_snapshot")
-    return {t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"] for t in tables}
+    tables = ("document", "entity", "claim", "entity_conflict", "macro_snapshot")
+    try:
+        return {t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"] for t in tables}
+    except sqlite3.OperationalError as exc:
+        raise _translate_missing_schema(exc) from exc
 
 
 def stored_doc_shas(conn: sqlite3.Connection) -> dict[str, str]:
@@ -204,9 +208,13 @@ def stored_doc_shas(conn: sqlite3.Connection) -> dict[str, str]:
     (the schema's `file_sha256` exists precisely to detect this) — surfaced loudly,
     never skipped. Same-doc_id re-extraction/supersession is deferred (see
     CLAUDE.md); the guarantee here is that a revision is never silently dropped."""
+    try:
+        rows = conn.execute("SELECT doc_id, file_sha256 FROM document").fetchall()
+    except sqlite3.OperationalError as exc:
+        raise _translate_missing_schema(exc) from exc
     return {
         row["doc_id"]: row["file_sha256"]
-        for row in conn.execute("SELECT doc_id, file_sha256 FROM document")
+        for row in rows
     }
 
 
@@ -297,9 +305,29 @@ _IDENTITY_COLS = ("vendor", "name", "entity_type")
 
 def _conflict_repr(value: object) -> str:
     """Stringify a stored/offered value for a conflict record: dates/bools/floats
-    via str() on the stored representation, truncated to the 120-char bound the
-    Conflict model and the entity_conflict DDL both enforce."""
-    return str(value)[:120]
+    via str() on the stored representation, control bytes scrubbed, truncated to
+    the 120-char bound the Conflict model and the entity_conflict DDL both
+    enforce. The scrub is load-bearing (appsec, 2026-08-18): a legacy/poisoned
+    stored value carrying a control byte would otherwise fail Conflict's
+    Text120 pattern and raise from INSIDE reconcile — aborting the whole
+    document instead of recording the refusal."""
+    return _CTRL_RE.sub(" ", str(value))[:120]
+
+
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+class StoreNotInitialized(RuntimeError):
+    """The DB file exists (or was just created by connect) but carries no
+    schema — `semianalyst db init` has not been run. Raised instead of a raw
+    sqlite OperationalError so the CLI can guide the operator without importing
+    sqlite3 (store is the sole SQLite owner)."""
+
+
+def _translate_missing_schema(exc: sqlite3.OperationalError) -> Exception:
+    if "no such table" in str(exc):
+        return StoreNotInitialized("database schema missing — run `semianalyst db init` first")
+    return exc
 
 
 def _foreign_surface_forms(conn: sqlite3.Connection, entity_id: str) -> set[str]:
@@ -448,12 +476,15 @@ def get_entities_for_analysis(conn: sqlite3.Connection) -> list[dict]:
 
 def get_claims_for_analysis(conn: sqlite3.Connection) -> list[ClaimView]:
     """Every claim, joined to its document's source_tier and publisher."""
-    rows = conn.execute(
-        "SELECT c.claim_id, c.doc_id, c.entity_id, c.metric, c.value, c.unit, "
-        "       c.cmp_is_relative, c.cmp_baseline_entity, c.cond_sparsity, "
-        "       c.completeness, d.source_tier, d.publisher "
-        "FROM claim c JOIN document d ON c.doc_id = d.doc_id"
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT c.claim_id, c.doc_id, c.entity_id, c.metric, c.value, c.unit, "
+            "       c.cmp_is_relative, c.cmp_baseline_entity, c.cond_sparsity, "
+            "       c.completeness, d.source_tier, d.publisher "
+            "FROM claim c JOIN document d ON c.doc_id = d.doc_id"
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        raise _translate_missing_schema(exc) from exc
     return [
         ClaimView(
             claim_id=r["claim_id"], doc_id=r["doc_id"], entity_id=r["entity_id"],

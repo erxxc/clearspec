@@ -155,11 +155,15 @@ class NodeAttributes(BaseModel):
 
 
 class ChipAttributes(BaseModel):
-    process_node_ref: str | None = None  # FK to the node entity — the join key
+    # v4 bounds apply here too — package_type/memory_type/process_node_ref were
+    # the one set of model-influenced strings the first bounds pass missed
+    # (appsec finding, 2026-08-18): unbounded, they let control bytes into the
+    # store AND crashed conflict recording against Conflict's Text120 pattern.
+    process_node_ref: SlugId80 | None = None  # FK to the node entity — the join key
     transistor_count_b: float | None = None
     die_size_mm2: float | None = None
-    package_type: str | None = None
-    memory_type: str | None = None
+    package_type: Text120 | None = None
+    memory_type: Text120 | None = None
     memory_bw_gbps: float | None = None
     tdp_w: float | None = None
     launch_date: dt.date | None = None

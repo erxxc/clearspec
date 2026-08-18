@@ -10,7 +10,7 @@ uv run semianalyst db init                     # create the SQLite schema (data/
 uv run semianalyst ingest-file paper.pdf \     # ingest a local file (operator path; network fetch WIP)
     --doc-id tsmc_n2 --title "TSMC N2" --publisher TSMC \
     --doc-type foundry_announcement --source-tier 2 --url https://pr.tsmc.com/...
-uv run semianalyst extract                     # extract grounded claims (needs ANTHROPIC_API_KEY)
+uv run semianalyst extract                     # extract grounded claims (needs ANTHROPIC_API_KEY only when work is pending)
 uv run semianalyst report                      # cross-source corroboration + divergence + conflicts
 uv run semianalyst forget tsmc_n2              # quarantine a poisoned doc's provenance + refold the DB
 uv run semianalyst db rebuild                  # refold the DB from retained extraction artifacts

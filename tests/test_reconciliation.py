@@ -180,20 +180,34 @@ def test_alias_collision_is_refused_and_recorded(tmp_config):
         conn.close()
 
 
-def test_conflict_values_truncate_at_120(tmp_config):
+def test_conflict_repr_scrubs_and_truncates(tmp_config):
+    """_conflict_repr is the last line of defense for conflict values (appsec,
+    2026-08-18): with package_type now Text120-bounded at the model layer, the
+    live risk is a LEGACY stored value — carried through migration 0004's length
+    CHECK with control bytes intact (DDL bounds length, not charset). A conflict
+    against it must record a SCRUBBED repr, never raise from inside reconcile
+    (an unsanitized value fails Conflict's Text120 pattern and aborted the whole
+    document's transaction)."""
+    from semianalyst.store.db import _conflict_repr
+
+    assert _conflict_repr("X" * 300) == "X" * 120           # truncation bound
+    assert _conflict_repr("CoWoS\x1bEVIL") == "CoWoS EVIL"  # C0 scrub
+
     conn = _conn(tmp_config)
     try:
-        # chip.package_type is unbounded in ChipAttributes — an over-long offered
-        # value must land in the conflict record truncated to the 120-char bound
-        # (the Conflict model and the entity_conflict CHECK both enforce it).
         store.persist_extraction(conn, _doc("d1"),
             [_entity(["N2"], chip=m.ChipAttributes(package_type="CoWoS"))], [])
+        # Legacy-poisoned stored value: <=120 so it passes the DDL length CHECK,
+        # written raw-SQL exactly as a pre-bounds row would have survived.
+        conn.execute("UPDATE entity SET chip_package_type = ? WHERE entity_id = ?",
+                     ("CoWoS\x1b[31mEVIL", "tsmc_n2"))
+        # An entirely honest differing offer must record the conflict, not crash.
         store.persist_extraction(conn, _doc("d2"),
-            [_entity(["N2"], chip=m.ChipAttributes(package_type="X" * 300))], [])
+            [_entity(["N2"], chip=m.ChipAttributes(package_type="InFO"))], [])
         conn.commit()
         [(kind, _, _, field, stored, offered)] = _conflicts(conn)
-        assert (kind, field, stored) == ("attribute", "chip.package_type", "CoWoS")
-        assert offered == "X" * 120
+        assert (kind, field, offered) == ("attribute", "chip.package_type", "InFO")
+        assert "\x1b" not in stored and "EVIL" in stored    # scrubbed, not raised
     finally:
         conn.close()
 

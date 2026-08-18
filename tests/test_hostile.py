@@ -831,3 +831,69 @@ def test_flag_budget(tmp_config: Config):
             f"honest assessment {assessment.entity_id}/{assessment.metric} "
             f"gained WS-2a flag(s) {sorted(leaked)} — flag budget exceeded")
     assert report.conflicts == [] and report.conflict_counts == {}
+
+
+# ---------------------------------------------------------------------------
+# 12. control_byte_chip_attribute — appsec HIGH (2026-08-18): the one field pair
+#     the first bounds pass missed
+# ---------------------------------------------------------------------------
+def test_control_byte_chip_attribute_rejected_at_shape(tmp_config: Config):
+    """ATTACK: a hostile proposal plants an ANSI escape in chip.package_type —
+    the field pair (package_type/memory_type) the original v4 bounds pass left
+    unbounded, letting raw control bytes into the store and later crashing
+    conflict recording. Now Text120-bounded: the entity drops fail-soft at
+    shape, the sibling survives, and nothing reaches the store raw."""
+    src = "Acme Z1 uses CoWoS. Acme Z2 also exists."
+    proposal = {
+        "entities": [
+            _pe("acme_z1", "Acme", "Z1",
+                chip={"package_type": "CoWoS\x1b[31mEVIL"},
+                cites={"chip.package_type": {"quote_span": "Acme Z1 uses CoWoS.",
+                                             "location_type": "body"}}),
+            _pe("acme_z2", "Acme", "Z2"),
+        ],
+        "claims": [],
+    }
+    result, rejections = validate_proposal(proposal, src)
+    assert [e.entity_id for e in result.entities] == ["acme_z2"]
+    assert any(r.kind == "entity" and "shape invalid" in r.reason for r in rejections)
+
+
+# ---------------------------------------------------------------------------
+# 13. malformed_sidecar — appsec MEDIUM (2026-08-18): fault isolation must hold
+#     for unreadable provenance files, or one bad file blocks extract AND forget
+# ---------------------------------------------------------------------------
+def test_malformed_sidecar_is_isolated(tmp_config: Config, tmp_path: Path):
+    """ATTACK/FAILURE: one corrupt .meta.json among honest ingests. The batch
+    must continue — the good document extracts, the corrupt sidecar lands in
+    ExtractReport.errors — and a non-UTF8 extraction artifact likewise degrades
+    to a RebuildReport error instead of crashing the refold (which would have
+    disabled `forget`, the retraction remedy itself)."""
+    good_src = tmp_path / "good.pdf"
+    good_src.write_bytes(_mini_pdf(["Vendor G good doc.", "G1 reaches 10 GB/s."]))
+    store.init_db(tmp_config)
+    good = ingest_file(tmp_config, good_src, doc_id="g1_doc", title="Good doc",
+                       publisher="Vendor G", doc_type="vendor_whitepaper", source_tier=3,
+                       url="https://example.test/g1", ingest_date="2026-01-01")
+
+    bad_src = tmp_path / "bad.pdf"
+    bad_src.write_bytes(_mini_pdf(["Vendor B bad doc."]))
+    bad = ingest_file(tmp_config, bad_src, doc_id="b1_doc", title="Bad doc",
+                      publisher="Vendor B", doc_type="vendor_whitepaper", source_tier=3,
+                      url="https://example.test/b1", ingest_date="2026-01-01")
+    # Corrupt the second sidecar in place (disk corruption / hand edit / partial write).
+    (tmp_config.paths.raw_dir / f"{bad.sha256}.meta.json").write_text("{not valid json")
+
+    proposal = {"entities": [_pe("vendorg_g1", "Vendor G", "G1")], "claims": []}
+    report = run_extract(tmp_config, extractor=AnthropicExtractor(
+        ReplayModelClient(json.dumps(proposal))))
+    assert report.extracted == ["g1_doc"]                       # batch continued
+    assert any(ident == bad.sha256 and "unreadable sidecar" in reason
+               for ident, reason in report.errors)
+
+    # Non-UTF8 artifact: refold degrades per-artifact, never crashes.
+    (tmp_config.paths.raw_dir / "ff00.extraction.json").write_bytes(b"\xff\xfe\x00garbage")
+    from semianalyst.extract import run_rebuild
+    rb = run_rebuild(tmp_config)
+    assert rb.folded == ["g1_doc"]
+    assert any("unreadable extraction artifact" in reason for _, reason in rb.errors)

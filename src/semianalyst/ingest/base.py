@@ -68,6 +68,7 @@ class RawDoc:
     sha256: str
     blob_path: Path
     meta: dict
+    is_new: bool = True  # False when ingest found the identical bytes already stored
 
 
 def store_raw(content: bytes, raw_dir: Path) -> RawRef:
@@ -93,7 +94,15 @@ def write_sidecar(raw_dir: Path, sha256: str, meta: dict) -> Path:
     raw_dir.mkdir(parents=True, exist_ok=True)
     dest = raw_dir / f"{sha256}{SIDECAR_SUFFIX}"
     if dest.exists():
-        existing = json.loads(dest.read_text()).get("doc_id")
+        try:
+            existing = json.loads(dest.read_text()).get("doc_id")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            # An unreadable existing sidecar is evidence, not free space —
+            # overwriting it would destroy whatever provenance it carried.
+            raise SidecarCollision(
+                f"existing sidecar for this content is unreadable "
+                f"({type(exc).__name__}); refusing to overwrite it"
+            ) from exc
         incoming = meta.get("doc_id")
         if existing != incoming:
             raise SidecarCollision(
@@ -128,7 +137,15 @@ def read_raw_docs(raw_dir: Path) -> tuple[list[RawDoc], list[tuple[str, str]]]:
         if actual != sha256:
             errors.append((sha256, f"blob hash mismatch: content hashes to {actual[:12]}"))
             continue
-        docs.append(RawDoc(sha256=sha256, blob_path=blob, meta=json.loads(sidecar.read_text())))
+        # A corrupt/hand-edited sidecar is that DOCUMENT's failure, never the
+        # batch's (appsec, 2026-08-18: an uncaught decode error here crashed the
+        # whole extract run — and, via forget's refold, blocked retraction).
+        try:
+            meta = json.loads(sidecar.read_text())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            errors.append((sha256, f"unreadable sidecar: {type(exc).__name__}"))
+            continue
+        docs.append(RawDoc(sha256=sha256, blob_path=blob, meta=meta))
     return docs, errors
 
 
@@ -174,7 +191,7 @@ def read_extraction_artifacts(raw_dir: Path) -> tuple[list[ExtractionArtifact], 
         sha256 = path.name[: -len(EXTRACTION_SUFFIX)]
         try:
             data = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             errors.append((sha256, f"unreadable extraction artifact: {type(exc).__name__}"))
             continue
         artifacts.append(ExtractionArtifact(sha256=sha256, path=path, data=data))

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 from dataclasses import dataclass, field
 
 from .. import store
@@ -40,6 +41,15 @@ from ..store import models
 from .base import AnthropicExtractor, AnthropicModelClient
 from .prompts import PromptVersion
 from .validate import ExtractionResult
+
+_ERR_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _err_repr(exc: Exception) -> str:
+    """Exception text can embed model-derived fragments (a pydantic error quotes
+    its input_value) — scrub control bytes at CAPTURE, not only at the CLI
+    display edge, so report objects never carry live escape bytes."""
+    return _ERR_CTRL.sub(" ", f"{type(exc).__name__}: {exc}")[:200]
 
 
 @dataclass
@@ -179,7 +189,7 @@ def run_extract(config: Config | None = None, *, extractor: AnthropicExtractor |
                     )
                     extracted.append(document.doc_id)
             except Exception as exc:  # per-document isolation, not a batch abort
-                errors.append((doc_id, f"{type(exc).__name__}: {exc}"[:200]))
+                errors.append((doc_id, _err_repr(exc)))
 
         note = ""
         if revised:
@@ -253,7 +263,7 @@ def run_rebuild(config: Config | None = None) -> RebuildReport:
                     store.persist_extraction(conn, document, entities, claims)
                 folded.append(doc_id)
             except Exception as exc:
-                errors.append((doc_id, f"{type(exc).__name__}: {exc}"[:200]))
+                errors.append((doc_id, _err_repr(exc)))
     finally:
         conn.close()
     os.replace(tmp_path, db_path)  # atomic swap: readers see the old store or the new, never half
