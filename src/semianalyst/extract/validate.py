@@ -20,6 +20,8 @@ grounded `ExtractionResult`, enforcing the schema's integrity rules in code:
                    location_type is forced to `unknown` (never `body`).
   7. Dedup       — one entity per (vendor, name); aliases, attribute VALUES, and
                    their citations are all reconciled into the surviving entity.
+                   The canonical `name` is always pinned into `aliases` — it is a
+                   surface form of the entity, and models repeat it inconsistently.
 
 Rejections carry only a kind, a model-supplied identifier/path (sanitized before
 logging), and a fixed reason string — never raw model text values, which under
@@ -225,6 +227,15 @@ def validate_proposal(
         else:
             seen[key] = ent
             kept_entities.append(ent)
+
+    # The canonical `name` is itself a surface form of the entity: pin it into
+    # aliases so alias-based resolution never depends on whether the model chose
+    # to repeat it there (a judgment call models make inconsistently). Applied to
+    # the surviving entities only, so a merged case-variant dup's name never
+    # injects alias noise.
+    for ent in kept_entities:
+        if ent.name not in ent.aliases:
+            ent.aliases.insert(0, ent.name)
 
     vendor_of = {e.entity_id: e.vendor for e in kept_entities}
     kept_entity_ids = set(vendor_of)

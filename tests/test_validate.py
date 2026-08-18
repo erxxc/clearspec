@@ -291,6 +291,33 @@ def test_entity_merge_reconciles_attribute_values():
     assert set(ent.aliases) == {"N2", "2nm"}
 
 
+def test_entity_name_is_pinned_into_aliases():
+    """Models repeat the canonical name in `aliases` inconsistently (the live-golden
+    flake, 2026-08-18) — validate pins it so the output is deterministic."""
+    without = _entity()  # aliases: []
+    result, _ = validate_proposal({"entities": [without], "claims": []}, "SRC")
+    assert result.entities[0].aliases == ["N"]
+
+    with_it = _entity()
+    with_it["aliases"] = ["N", "Marketing Name"]
+    result, _ = validate_proposal({"entities": [with_it], "claims": []}, "SRC")
+    assert result.entities[0].aliases == ["N", "Marketing Name"]  # present once, order kept
+
+
+def test_merged_dup_name_variant_does_not_pollute_aliases():
+    """Pinning applies to SURVIVING entities only: a case-variant dup's `name` is
+    not injected into the merged alias set."""
+    p = {"entities": [
+        {"entity_id": "tsmc_n2", "entity_type": "process_node", "vendor": "TSMC", "name": "N2",
+         "aliases": [], "node": None, "chip": None, "attribute_citations": {}},
+        {"entity_id": "tsmc_n2_dup", "entity_type": "process_node", "vendor": "TSMC", "name": "n2",
+         "aliases": ["2nm"], "node": None, "chip": None, "attribute_citations": {}}],
+        "claims": []}
+    result, _ = validate_proposal(p, "N2 stuff.")
+    assert len(result.entities) == 1
+    assert result.entities[0].aliases == ["N2", "2nm"]  # name pinned first; no "n2"
+
+
 def test_stray_attribute_citation_is_dropped_and_logged():
     """A citation for an exempt/unknown attribute path is dropped WITH a rejection."""
     src = "N2 exists."
