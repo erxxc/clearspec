@@ -13,6 +13,7 @@ Proves the glue WS-1 added, not the components (each is covered by its own suite
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -95,10 +96,12 @@ def test_run_extract_no_pending_is_a_noop(tmp_config: Config):
     assert report.note  # tells the operator to ingest a file
 
 
-def test_source_revision_is_surfaced_not_silently_skipped(tmp_config: Config, tmp_path: Path):
+def test_source_revision_is_extracted_and_superseded(tmp_config: Config, tmp_path: Path):
     """Same doc_id + CHANGED bytes must NOT be silently classified 'skipped' (that
-    would defeat the schema's file_sha256 revision signal). It surfaces in `revised`
-    with loud operator guidance; supersession is deferred (gate decision Q1)."""
+    would defeat the schema's file_sha256 revision signal). WS-2a: the revision IS
+    extracted, its artifact retained, and the store refolded so it holds only the
+    latest revision per doc_id (gate resolution, Challenge 1). Deeper store-state
+    assertions live in test_rebuild.py."""
     store.init_db(tmp_config)
     ingest_file(tmp_config, CASE_DIR / "raw.pdf", **_INGEST_KW)
     recorded = json.loads((CASE_DIR / "llm_response.json").read_text())
@@ -110,11 +113,23 @@ def test_source_revision_is_surfaced_not_silently_skipped(tmp_config: Config, tm
     ingest_file(tmp_config, revised_pdf, **_INGEST_KW)  # same doc_id, different bytes
 
     rep = run_extract(tmp_config, extractor=extractor)
-    assert rep.extracted == []
-    assert DOC_ID in rep.revised          # the revision is surfaced...
+    assert rep.extracted == [] and rep.errors == []
+    assert rep.revised == [DOC_ID]        # the revision is surfaced AND processed...
     assert DOC_ID in rep.skipped          # ...while the original bytes stay an honest skip
-    assert rep.note                        # loud guidance, not a silent drop
-    # the store still holds exactly the original extraction — nothing superseded
+    assert rep.note                        # loud: superseded via refold, not silent
+    # the refolded store holds exactly ONE extraction — the revision's, not two
+    assert _counts(tmp_config)["document"] == 1 and _counts(tmp_config)["claim"] == 1
+    conn = store.connect(tmp_config.paths.db_path)
+    try:
+        stored = store.stored_doc_shas(conn)
+    finally:
+        conn.close()
+    assert stored[DOC_ID] == hashlib.sha256(revised_pdf.read_bytes()).hexdigest()
+
+    # a re-run is idempotent: both sidecars (original + revision) are honest skips
+    again = run_extract(tmp_config, extractor=extractor)
+    assert again.extracted == [] and again.revised == [] and again.errors == []
+    assert again.skipped.count(DOC_ID) == 2
     assert _counts(tmp_config)["document"] == 1 and _counts(tmp_config)["claim"] == 1
 
 

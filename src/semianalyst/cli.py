@@ -22,8 +22,8 @@ import typer
 from . import store
 from .analyze import run_analysis
 from .config import load_config
-from .extract.pipeline import run_extract
-from .ingest.pipeline import ingest_file, run_ingest
+from .extract.pipeline import run_extract, run_rebuild
+from .ingest.pipeline import forget, ingest_file, run_ingest
 
 app = typer.Typer(
     help="semianalyst — ingest semiconductor releases and extract quantitative claims.",
@@ -102,10 +102,42 @@ def extract() -> None:
     )
     for doc_id in report.extracted:
         typer.echo(f"  extracted: {_ansi_safe(doc_id)}")
-    for doc_id in report.revised:  # loud: a source revision was NOT extracted
-        typer.echo(f"  REVISION (not extracted): {_ansi_safe(doc_id)}")
+    for doc_id in report.revised:  # loud: a source revision was extracted and folded in
+        typer.echo(f"  REVISION (extracted + folded): {_ansi_safe(doc_id)}")
     for doc_id, reason in report.errors:
         typer.echo(f"  ERROR {_ansi_safe(doc_id)}: {_ansi_safe(reason)}")
+
+
+@app.command("forget")
+def forget_cmd(
+    doc_id: str = typer.Argument(..., help="doc_id to retract (quarantine + refold)."),
+) -> None:
+    """Retract a document: quarantine its sidecar(s) + extraction artifact(s) under
+    data/quarantine/ and rebuild the store without it. Raw blobs are retained."""
+    report = forget(load_config(), doc_id)
+    typer.echo(f"quarantined: {len(report.quarantined)} file(s) for doc_id={_ansi_safe(report.doc_id)}")
+    for name in report.quarantined:
+        typer.echo(f"  quarantined: {_ansi_safe(name)}")
+    rb = report.rebuild
+    typer.echo(f"refolded: {len(rb.folded)}  superseded: {len(rb.superseded)}  errors: {len(rb.errors)}")
+    for ident, reason in rb.errors:
+        typer.echo(f"  ERROR {_ansi_safe(ident)}: {_ansi_safe(reason)}")
+
+
+@db_app.command("rebuild")
+def db_rebuild() -> None:
+    """Rebuild the SQLite store as a deterministic fold over retained extraction artifacts."""
+    report = run_rebuild(load_config())
+    typer.echo(
+        f"folded: {len(report.folded)}  superseded: {len(report.superseded)}  "
+        f"errors: {len(report.errors)}"
+    )
+    for doc_id in report.folded:
+        typer.echo(f"  folded: {_ansi_safe(doc_id)}")
+    for doc_id in report.superseded:
+        typer.echo(f"  superseded: {_ansi_safe(doc_id)}")
+    for ident, reason in report.errors:
+        typer.echo(f"  ERROR {_ansi_safe(ident)}: {_ansi_safe(reason)}")
 
 
 @app.command()

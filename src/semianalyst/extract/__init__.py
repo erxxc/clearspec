@@ -10,7 +10,7 @@ from .base import (
     ModelClient,
     ReplayModelClient,
 )
-from .pipeline import ExtractReport, run_extract
+from .pipeline import ExtractReport, RebuildReport, run_extract, run_rebuild
 from .prompts import PromptVersion
 from .validate import (
     ExtractionError,
@@ -26,7 +26,9 @@ __all__ = [
     "ModelClient",
     "ReplayModelClient",
     "ExtractReport",
+    "RebuildReport",
     "run_extract",
+    "run_rebuild",
     "PromptVersion",
     "ExtractionError",
     "ExtractionResult",
