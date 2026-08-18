@@ -88,20 +88,43 @@ from the Class A list here + in CLAUDE.md.
   injection-live-in-WS-1 framing + add a wiring injection test) and applied; per-doc
   fault isolation added. Gate outcome: **proceed**.
 
-### WS-2 — Live ingest (network fetch) + Class A trust model — **AFTER WS-1, gated**
+### WS-2 — Live ingest (network fetch) + Class A trust model — **PLAN GATE PASSED (2026-08-18, proceed-with-conditions)**
 
-Implements `FoundryFetcher.fetch` (HTTPS-only, rate-limited, idempotent via
-`store_raw`) and `run_ingest`. **The moment fetch lands, the entire Class A set
-goes live simultaneously** — so this workstream MUST open with a *trust-model
-design gate* (swarm review) that resolves the deferred decisions as a named set,
-not piecemeal. Class A items (authoritatively defined in CLAUDE.md): **K** (tier
-precedence / `favored_tier` suspect-exclusion), **G** (alias-union gating), **H**
-(tier-diversity floor for `corroborated`), resolved-baseline poisoning,
-identity-field conflict, baseline content-bound, **I/J** (persisted conflict
-records, slug-collision strength), plus the WS-1-gate additions — **sidecar
-identity binding**, **blob content-hash not re-verified at read**, and **Unicode
-bidi/zero-width display spoofing**. Adversarial suite must be a *named hostile
-suite*, never the honest acceptance golden.
+Trust-model design gate run at `docs/reviews/2026-08-18-live-ingest-plan/`
+(3× conditional + devils-advocate challenge; four forks adjudicated by the
+human — see `resolution.md`, which is authoritative). Build order:
+
+1. **Standalone fix on `main` (pre-WS-2a, live bug):** `conditions.sparsity` is
+   model-proposed and ungrounded while `corroborate.py`'s suspect-exclusion
+   already depends on it — fix via quote-span sparse-vocabulary grounding that
+   fails toward suspect, plus the vendor case-fold dedup fix (one doc's
+   `"TSMC"`/`"Tsmc"` currently makes two entities).
+2. **WS-2a — trust hardening (zero network):** extraction **artifact + refold**
+   (per-doc validated extraction persisted beside the raw blob; DB = rebuildable
+   fold; ships `forget <doc_id>` + `db rebuild` + revision supersession — this
+   also retires WS-1's deferred same-doc_id supersession); hardened persisted
+   **conflict table** (schema v4 + migration 0004; values bounded ≤120 and
+   display-sanitized; `reconcile_entity` rewritten read-compare-write with
+   offender doc_id); full content bounds **with mirrored SQLite CHECKs**; G1
+   alias grounding + G3 collision refusal; **H1 publisher-diversity floor**
+   (normalized publisher); group-key normalization (`metric`/`unit`/`publisher`)
+   + advisory `possible_split_metric`; entity name/vendor presence-grounding;
+   S1 sidecar binding + S2 blob-hash re-verify; Unicode Cf display stripping;
+   J advisory flag. Acceptance: named hostile suite **plus honest-corpus
+   regression** (golden verdicts unchanged except approved diffs) **plus flag
+   budget** (≤1 new flag per honest assessment).
+3. **WS-2b — fetcher:** direct document URLs only (HTML discovery → WS-3);
+   HTTPS-only re-validated per redirect hop, redirect/size caps, PDF magic
+   bytes, config rate limits; URL-slug doc_id (safe now that supersession
+   exists); sidecar from operator watchlist fields; local-server tests only.
+
+**Deferred with named triggers** (from the gate): **H2** all-tier-3 confidence
+cap — trigger: watchlist carries ≥2 distinct tier-3 publishers for one metric;
+**B1** baseline surface-form binding — cut (near-empty true-positive surface);
+trigger: a demonstrated misattributed-measurement case; **controlled metric
+vocabulary** — trigger: real corpus shows split groups normalization can't
+close; **identity citation slots** — trigger: schema v5. Precommit gate to run
+on the WS-2a diff.
 
 ### Deferred (correctly) — revisit on trigger
 
@@ -124,6 +147,15 @@ suite*, never the honest acceptance golden.
 
 ## Sequencing decision log
 
+- **2026-08-18 — WS-2 plan gate: four forks adjudicated by human.** (1)
+  Retraction/supersession: **artifact + refold** adopted over flag-only (a
+  poisoned store must be fixable; URL-slug doc_id otherwise makes revisions
+  permanently unextractable). (2) Conflict record: **durable hardened table**
+  over log-only (log-only cannot carry the offered value without violating
+  validate's never-log-raw-model-text invariant). (3) Trims accepted: defer H2,
+  cut B1 (keep the B2 bound), normalization-now/vocabulary-later. (4) Grounding:
+  sparsity fix ships as a standalone bug-fix on `main` first; bounds get DDL
+  parity. Full record: `docs/reviews/2026-08-18-live-ingest-plan/resolution.md`.
 - **2026-07-27 — extract-wiring before live-ingest (confirmed by human).**
   Context: two stubs (ingest fetch, `run_extract`) block the E2E loop; persist +
   analyze already built. Options: (1) wire `run_extract` first, (2) live ingest
