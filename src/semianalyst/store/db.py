@@ -51,13 +51,16 @@ def _applied_versions(conn: sqlite3.Connection) -> set[int]:
     return {row["version"] for row in conn.execute("SELECT version FROM schema_migrations")}
 
 
-def init_db(config: Config | None = None) -> Path:
+def init_db(config: Config | None = None, *, db_path: Path | None = None) -> Path:
     """Apply all pending migrations. Idempotent — safe to run repeatedly.
 
-    Returns the path to the initialized database.
+    `db_path` overrides config.paths.db_path: the rebuild fold (extract.run_rebuild)
+    initializes a temp file it later atomically swaps over the configured path;
+    everything else uses the config. Returns the path to the initialized database.
     """
-    config = config or load_config()
-    db_path = config.paths.db_path
+    if db_path is None:
+        config = config or load_config()
+        db_path = config.paths.db_path
     conn = connect(db_path)
     try:
         applied = _applied_versions(conn)
