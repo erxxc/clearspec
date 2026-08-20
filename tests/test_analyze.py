@@ -47,10 +47,15 @@ def test_acceptance_golden(tmp_config):
 # Unit cases — construct ClaimViews directly, no store.
 # --------------------------------------------------------------------------
 def _cv(claim_id, metric, value, tier, *, is_relative=True, baseline="b",
-        sparsity=None, completeness="complete", unit="x", entity_id="e") -> ClaimView:
+        sparsity=None, completeness="complete", unit="x", entity_id="e",
+        publisher=None) -> ClaimView:
+    # Default publisher is DISTINCT per claim: these unit cases exercise
+    # tolerance/suspect logic, not the H1 publisher floor — H1 tests set a
+    # shared publisher explicitly.
     return ClaimView(claim_id=claim_id, doc_id="d", entity_id=entity_id, metric=metric,
                      value=value, unit=unit, is_relative=is_relative, baseline_entity=baseline,
-                     sparsity=sparsity, completeness=completeness, source_tier=tier)
+                     sparsity=sparsity, completeness=completeness, source_tier=tier,
+                     publisher=publisher if publisher is not None else f"pub_{claim_id}")
 
 
 _INDEX = {"e": ["e"], "b": ["b"]}
@@ -145,3 +150,104 @@ def test_tolerance_boundary():
     # (1.12-1.0)/1.12 = 10.7% > 10
     beyond = analyze_claims([_cv("a", "m", 1.0, 2), _cv("z", "m", 1.12, 1)], _INDEX)
     assert beyond.assessments[0].status == "contradicted"
+
+
+# --------------------------------------------------------------------------
+# WS-2a (2026-08-18 gate): H1 publisher floor, key normalization, advisory
+# flags, conflict surfacing, display Cf-stripping.
+# --------------------------------------------------------------------------
+def test_single_publisher_agreement_demotes_to_weakly():
+    """H1: one publisher agreeing with itself is one voice, however many PDFs."""
+    rep = analyze_claims([_cv("a", "m", 1.15, 3, publisher="VendorX"),
+                          _cv("z", "m", 1.16, 3, publisher="VendorX")], _INDEX)
+    a = rep.assessments[0]
+    assert a.status == "weakly_corroborated"
+    assert "single_publisher" in a.flags
+
+
+def test_publisher_normalization_counts_variants_as_one():
+    """Casing/whitespace publisher variants are ONE publisher for the floor."""
+    rep = analyze_claims([_cv("a", "m", 1.15, 3, publisher="VendorX"),
+                          _cv("z", "m", 1.16, 3, publisher="  vendorx ")], _INDEX)
+    assert rep.assessments[0].status == "weakly_corroborated"
+
+
+def test_distinct_publishers_corroborate():
+    rep = analyze_claims([_cv("a", "m", 1.15, 3, publisher="VendorX"),
+                          _cv("z", "m", 1.16, 3, publisher="FoundryY")], _INDEX)
+    assert rep.assessments[0].status == "corroborated"
+
+
+def test_metric_normalization_merges_casing_variants_into_one_group():
+    """The group key is attacker-influenceable free text: 'Logic Speed' and
+    'logic  speed' must land in ONE group (evasion via a casing variant)."""
+    rep = analyze_claims([_cv("a", "Logic Speed", 1.15, 2),
+                          _cv("z", "logic  speed", 1.16, 1)], _INDEX)
+    assert len(rep.assessments) == 1
+    assert rep.assessments[0].status == "corroborated"
+
+
+def test_possible_split_metric_advisory_fires_on_near_identical_metrics():
+    rep = analyze_claims([_cv("a", "logic_speed", 1.15, 2),
+                          _cv("z", "logic_speeds", 2.4, 3)], _INDEX)
+    assert len(rep.assessments) == 2
+    for a in rep.assessments:
+        assert "possible_split_metric" in a.flags
+
+
+def test_possible_split_metric_does_not_fire_on_distinct_metrics():
+    rep = analyze_claims([_cv("a", "logic_speed", 1.15, 2),
+                          _cv("z", "power_draw", 2.4, 3)], _INDEX)
+    for a in rep.assessments:
+        assert "possible_split_metric" not in a.flags
+
+
+def test_possible_slug_collision_advisory():
+    """J: two stored entities sharing (entity_type, vendor) + a surface form."""
+    detail = [
+        {"entity_id": "e", "entity_type": "process_node", "vendor": "TSMC",
+         "name": "N2", "aliases": ["N2", "2nm"]},
+        {"entity_id": "e2", "entity_type": "process_node", "vendor": "tsmc",
+         "name": "N2P", "aliases": ["N2P", "2nm"]},
+    ]
+    rep = analyze_claims([_cv("a", "m", 1.15, 2), _cv("z", "m", 1.16, 1)],
+                         _INDEX, entities_detail=detail)
+    assert "possible_slug_collision" in rep.assessments[0].flags
+
+    disjoint = [dict(detail[0]), {"entity_id": "e2", "entity_type": "process_node",
+                "vendor": "tsmc", "name": "N3", "aliases": ["N3"]}]
+    rep = analyze_claims([_cv("a", "m", 1.15, 2)], _INDEX, entities_detail=disjoint)
+    assert "possible_slug_collision" not in rep.assessments[0].flags
+
+
+def test_identity_conflict_flag_and_report_serialization():
+    """A persisted conflict surfaces as a flag on the entity's assessments and
+    (only when present) as conflicts/conflict_counts in to_dict — a conflict-free
+    report keeps the v3 dict shape for fixture stability."""
+    conflict = m.Conflict(kind="identity_field", entity_id="e", doc_id="d2",
+                          field="vendor", stored_value="V", offered_value="W",
+                          created_at="2026-08-18T00:00:00+00:00")
+    rep = analyze_claims([_cv("a", "m", 1.15, 2)], _INDEX,
+                         conflicts=[conflict], conflict_counts={"e": 1})
+    assert "identity_conflict" in rep.assessments[0].flags
+    d = rep.to_dict()
+    assert d["conflict_counts"] == {"e": 1}
+    assert d["conflicts"][0]["offered_value"] == "W"
+
+    clean = analyze_claims([_cv("a", "m", 1.15, 2)], _INDEX)
+    assert "conflicts" not in clean.to_dict()
+    assert "identity_conflict" not in clean.assessments[0].flags
+
+
+def test_ansi_safe_strips_unicode_format_chars():
+    """§2.8: bidi/zero-width/BOM (category Cf) are stripped; normal Unicode —
+    including symbols honest specs use — survives."""
+    from semianalyst.cli import _ansi_safe
+    hostile = "safe‮ EVIL ​﻿⁦also⁩"
+    cleaned = _ansi_safe(hostile)
+    for cp in ("‮", "​", "﻿", "⁦", "⁩"):
+        assert cp not in cleaned
+    assert "EVIL" in cleaned and "also" in cleaned
+    assert _ansi_safe("5 nm² at 1 µm pitch") == "5 nm² at 1 µm pitch"
+    # Combined ANSI + Cf payload in one string (the offered_value shape).
+    assert _ansi_safe("\x1b[31m‭X\x1b[0m") == "X"

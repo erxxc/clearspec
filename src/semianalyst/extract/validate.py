@@ -8,7 +8,11 @@ grounded `ExtractionResult`, enforcing the schema's integrity rules in code:
   2. Normalize   — month-precision dates -> first-of-month; units -> canonical.
   3. Ground      — every claim quote_span AND every entity attribute_citation
                    quote_span must appear in the source text, else the claim is
-                   dropped / the attribute is nulled.
+                   dropped / the attribute is nulled. Identity is grounded too
+                   (2026-08-18 gate): an entity whose name or vendor never
+                   appears in the source is dropped, and an ungrounded alias is
+                   dropped from its list (G1) — both case-insensitive presence
+                   floors (existence, not verbatim-quote proof).
   4. Provenance  — a claim must be about an entity extracted from THIS document
                    (claim.entity_id present in the proposal), else it's dropped.
   5. Integrity   — a relative claim must use a ratio/percent unit (never an
@@ -49,6 +53,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel, ValidationError
 
 from ..store import models
+from ..textnorm import CTRL_CLASS, fold
 from .pdf import is_grounded
 
 logger = logging.getLogger(__name__)
@@ -67,7 +72,8 @@ class ExtractionResult(BaseModel):
 
 @dataclass(frozen=True)
 class Rejection:
-    kind: str      # "claim" | "entity" | "entity_attribute" | "entity_merge"
+    kind: str      # "claim" | "claim_condition" | "entity" | "entity_alias" |
+                   #   "entity_attribute" | "entity_merge"
     target: str    # id / path (model-supplied) — sanitized before logging
     reason: str
 
@@ -100,7 +106,7 @@ GROUNDABLE: dict[str, list[str]] = {
 }
 _VALID_PATHS = {f"{sub}.{f}" for sub, fields in GROUNDABLE.items() for f in fields}
 
-_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+_CTRL = re.compile(CTRL_CLASS)  # shared CLASS, local scrub semantics (textnorm)
 
 # Sparse-benchmark vocabulary (v1, 2026-08-18 gate — injection F1, a live bug):
 # conditions.sparsity is model-proposed, and a hostile document can steer the
@@ -115,6 +121,14 @@ _SPARSE_VOCAB_V1 = re.compile(r"(?i)\b(spars\w*|prun\w*|2:4)\b")
 def _safe(text: str) -> str:
     """Sanitize a model-controlled id/path before it enters a log line."""
     return _CTRL.sub(" ", text)[:120]
+
+
+def _grounded_ci(text: str, source_text: str) -> bool:
+    """Case-insensitive `is_grounded` — for identity SURFACE FORMS only (name,
+    vendor, aliases), whose casing varies legitimately ("TSMC"/"Tsmc", same as
+    the dedup key). Quote spans stay case-sensitive: they claim to be verbatim
+    quotes; identity presence is an existence floor, not a quote."""
+    return is_grounded(text.casefold(), source_text.casefold())
 
 
 def normalize_date_str(value: str) -> str:
@@ -187,10 +201,39 @@ def validate_proposal(
             rejections.append(Rejection("claim", str(cid),
                                         f"shape invalid at {[e['loc'] for e in exc.errors()]}"))
 
-    # --- entities: ground attributes, log stray drops, force unknown, dedup ---
+    # --- entities: presence-ground identity, ground attributes + aliases, dedup ---
     kept_entities: list[models.Entity] = []
     seen: dict[tuple[str, str], models.Entity] = {}
     for ent in entities:
+        # Identity presence-grounding (2026-08-18 gate — the "identity citation
+        # slots" residual): name/vendor have no attribute_citations home, so a
+        # hostile proposal could otherwise mint an entity for a vendor the
+        # document never mentions (the first-hostile-writer identity plant).
+        # Presence in the source text is the cheap floor — full citation slots
+        # are deferred to schema v5. Fail-soft: drops THIS entity (its claims
+        # cascade via the kept-entity check below), never the extraction.
+        if not _grounded_ci(ent.name, source_text):
+            rejections.append(Rejection("entity", ent.entity_id,
+                                        "name not found in source"))
+            continue
+        if not _grounded_ci(ent.vendor, source_text):
+            rejections.append(Rejection("entity", ent.entity_id,
+                                        "vendor not found in source"))
+            continue
+        # G1 — alias grounding (2026-08-18 gate): every model-proposed alias
+        # must appear in THIS document's text, or a hostile doc could plant a
+        # competitor's product name as an alias and capture its claims at
+        # store-reconciliation time. Runs BEFORE dedup so merged entities union
+        # only grounded aliases. The rejection target is the alias's list index,
+        # never the alias string itself (a rejection carries no raw model text).
+        kept_aliases: list[str] = []
+        for idx, alias in enumerate(ent.aliases):
+            if _grounded_ci(alias, source_text):
+                kept_aliases.append(alias)
+            else:
+                rejections.append(Rejection("entity_alias", f"{ent.entity_id}:{idx}",
+                                            "alias not found in source"))
+        ent.aliases = kept_aliases
         for sub in ("node", "chip"):
             attrs = getattr(ent, sub)
             if attrs is None:
@@ -214,9 +257,11 @@ def validate_proposal(
             else:
                 _force_unknown(ent.attribute_citations[path])
 
-        # Vendor is case-folded like name: one document's "TSMC"/"Tsmc" is one
-        # vendor, not two entities (2026-08-18 gate, schema-purist risk).
-        key = (ent.vendor.strip().lower(), ent.name.strip().lower())
+        # One document's "TSMC"/"Tsmc"/"TSMC " is one vendor, not two entities —
+        # the SHARED fold (textnorm), so dedup, reconcile, and analyze answer
+        # "same value?" identically (precommit gate: three drifting copies had
+        # shipped three different answers).
+        key = (fold(ent.vendor), fold(ent.name))
         if key in seen:
             base = seen[key]
             for alias in ent.aliases:
@@ -247,7 +292,8 @@ def validate_proposal(
     # aliases so alias-based resolution never depends on whether the model chose
     # to repeat it there (a judgment call models make inconsistently). Applied to
     # the surviving entities only, so a merged case-variant dup's name never
-    # injects alias noise.
+    # injects alias noise. Exempt from G1 by construction: the name is the
+    # shape-validated identity field, already presence-grounded above.
     for ent in kept_entities:
         if ent.name not in ent.aliases:
             ent.aliases.insert(0, ent.name)

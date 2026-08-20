@@ -7,14 +7,17 @@ reverse once data and prompts accumulate.
 The schema defines every structure; pydantic models (`store/models.py`) and the
 SQLite DDL (`store/migrations/`) are both derived from it. Change the schema
 first; regenerate the models and add a migration — never the other way around.
-**`schema/extraction_schema_v3.yaml` is current**; `_v1`/`_v2` are retained
+**`schema/extraction_schema_v4.yaml` is current**; `_v1`/`_v2`/`_v3` are retained
 unedited. v2 added per-attribute grounding (`entity.attribute_citations`) and a
 fail-safe `unknown` `citation.location_type`; v3 added `weakly_corroborated` as a
 `corroboration.status` verdict value (a group that agrees within tolerance but has
 <2 non-suspect members — a clean number + an honestly-disclosed sparsity number)
 and made corroboration **derive-on-read, not persisted** — migration 0003 dropped
 the per-row `corr_status`/`corr_related_claim_ids` columns (a per-group verdict has
-no honest per-row home) and dropped the `cmp_baseline_entity` FK.
+no honest per-row home) and dropped the `cmp_baseline_entity` FK. v4 (WS-2a,
+2026-08-18 gate) added the persisted `conflict` record and two-layer content
+bounds (pydantic length+charset; DDL length CHECKs — migration 0004), and
+documented the extraction-artifact fold.
 
 ## The claim is the atomic unit — and its integrity rules are non-negotiable
 - **Every extracted value cites a source span** — code-enforced, not trusted to
@@ -22,7 +25,12 @@ no honest per-row home) and dropped the `cmp_baseline_entity` FK.
   isn't a (whitespace-normalized) substring of the source, and nulls any entity
   attribute whose `attribute_citations` entry isn't grounded (v2). The LLM output
   is a PROPOSAL; validation is the guarantee. `location_type` fails safe to
-  `unknown` under flat-text extraction (never laundered to `body`).
+  `unknown` under flat-text extraction (never laundered to `body`). **Grounding
+  is a FIDELITY boundary, not a trust boundary** (2026-08-18 precommit gate): it
+  proves the model didn't fabricate *relative to the document* — and the
+  document is adversary-authored, so a hostile PDF can ground anything it
+  chooses to print. Trust comes from the cross-document layer: provenance,
+  conflict records, H1, tiers — never from grounding alone.
 - **Relative claims are never converted to absolutes.** Store the ratio and the
   baseline reference (`comparison.is_relative`, `comparison.baseline_entity`) so
   the distortion stays visible. "2.5x faster" is stored as `2.5` + baseline, not
@@ -50,9 +58,18 @@ concern, not the database's.)
 
 **Persistence + reconciliation (`store.persist_extraction`).** Inserts a document
 (plain `INSERT`, fail-loud on a duplicate `doc_id`), reconciles each entity
-(`reconcile_entity`: union aliases, fill NULL node/chip attributes, **never**
-overwrite a non-null one), and inserts claims under a doc-scoped `claim_id`
-(`{doc_id}:{id}`) so two docs' claims coexist. `cmp_baseline_entity` has no FK (a
+(`reconcile_entity(conn, ent, doc_id)`: read-compare-write since WS-2a — union
+grounded aliases, fill NULL node/chip attributes with their citations as a pair,
+**never** overwrite a non-null one, and persist an `entity_conflict` record for
+every refusal: `identity_field` (frozen vendor/name/entity_type differ,
+case-folded compare), `attribute` (K2: differing non-null), `alias_collision`
+(G3: incoming alias equals another entity's surface form — not unioned)), and
+inserts claims under a doc-scoped `claim_id` (`{doc_id}:{id}`) so two docs'
+claims coexist. Conflict values are adversary-authored, bounded ≤120 at model +
+DDL layers, and displayed ONLY through `cli._ansi_safe`. Conflicts are per-EVENT
+facts persisted because the offered value has no other home (2026-08-18 gate,
+Conflict 1 — the derive-on-read precedent B2 does not transfer); they regenerate
+deterministically on refold and vanish with forgotten/superseded docs. `cmp_baseline_entity` has no FK (a
 baseline may be cross-document or dangling; analyze flags `unresolved_baseline`).
 There is **no persisted per-row corroboration verdict** — migration 0003 dropped
 the `corr_status`/`corr_related_claim_ids` columns. Corroboration is a per-GROUP
@@ -63,68 +80,100 @@ but `insert_claim` never writes it and nothing reads it back. Do not re-add a
 persisted per-row verdict without settling the per-group-fact-in-a-per-row-home
 question (decision B2, analyze GATE-2 resolution).
 
-**Cross-document TRUST is DEFERRED to the live-ingest workstream (Class A).**
-Nuance corrected at the WS-1 gate (2026-07-27): the prompt-injection SURFACE is
-already live — `run_extract` calls the real model on operator-ingested,
-third-party-authored PDFs (the tool's whole purpose is semi-adversarial vendor
-marketing), so a hostile PDF body reaches the model *in production today*. That
-surface is DEFENDED, not deferred: the `DOC_OPEN`/`DOC_CLOSE` DATA delimiter, the
-`validate.py` per-document grounding (fabricated/exfil claims dropped), and the
-injection tests (`test_injection_wiring_offline` through the real wiring +
-`test_injection_live` against the real model) are the guarantee. Only the network
-FETCH of the bytes is deferred to WS-2. What remains genuinely deferred is
-cross-document TRUST — no single curated/operator-fed document can exercise it,
-and no hostile document can corrupt *cross-document* reconciliation or the
-corroboration verdict yet. When live ingest lands, these decisions must be made
-and enforced with a *named adversarial suite* (never the honest acceptance golden):
-- **K** — does a strictly-higher-trust document ever override a non-null attribute,
-  or only race a null one? (current: first-non-null-wins, tier-blind.) This also
-  governs `favored_tier`: it currently ships **tier-blind** (`min` over *all*
-  contradiction members, suspects included) — a sparsity flag does NOT override the
-  tier ordering. Whether a suspect member should be excluded (letting sparsity
-  demote a tier) is part of K, unbuilt.
-- **G** — alias-union gating (a tier-3 doc can currently inject any alias string).
-- **H** — a **status-level** tier-diversity floor for `corroborated` (stop tier-3
-  flooding; the MVP has no floor, one doc per tier).
-- **Resolved-baseline poisoning** — a hostile doc setting `baseline_entity` to a
-  real, already-stored competitor entity (unvalidated; P2 only flags *dangling*).
-- **Identity-field conflict** — on entity merge, `reconcile_entity` unions
-  aliases/attribute_citations and fills nulls, but `vendor`/`name`/`entity_type`
-  are frozen by the *first* document; a later document's differing values are
-  dropped with no signal. A typo'd vendor silently conflates two real things under
-  one `entity_id`. No conflict detection built.
-- **Sidecar identity binding** (named at the WS-1 gate) — the ingest sidecar has no
-  invariant tying content identity to document identity. Same doc_id + CHANGED bytes
-  is now surfaced loudly (`run_extract` → `ExtractReport.revised`, never a silent
-  skip), but same-doc_id re-extraction/supersession is deferred. The inverse is
-  unguarded: the SAME bytes re-ingested under a DIFFERENT doc_id last-write-wins the
-  `<sha256>.meta.json` sidecar (`write_sidecar` overwrites), clobbering the first
-  ingest's provenance with no merge or signal — a sibling of Identity-field conflict
-  at the sidecar layer.
-- **Blob content-hash not re-verified at read** — `read_raw_docs` trusts the sidecar
-  FILENAME as the sha256 and never recomputes the blob's hash; the only real hash is
-  computed at `store_raw` write time. Fine for the single-writer operator MVP;
-  matters once WS-2 introduces concurrent/adversarial writers to `data/raw/`.
-- **Baseline content-bound** — post-0003 `cmp_baseline_entity` is unconstrained
-  TEXT (the FK drop removed the shape guard too, not just the existence guard). No
-  length/byte-content bound on it or on free-text `metric`.
-- **Report display safety (ANSI/OSC/control escapes)** — RESOLVED 2026-07-27 (WS-1).
-  `cli.py:report()` sanitizes every DB-derived display string (`entity_id`,
-  `aliases`, `metric`, `baseline_entity`) through `cli._ansi_safe`, which strips
-  ANSI/OSC/control-escape sequences (the load rests on the `_CTRL` catch-all; the
-  named OSC/CSI patterns only clean inert printable residue). Terminal output
-  encoding lives at the CLI edge deliberately (a web UI would HTML-escape instead),
-  so it is not a shared library capability. Covered by
-  `test_report_display_is_ansi_sanitized`. **Scope is escapes only** — see the next
-  item for the Unicode half, which is NOT closed.
-- **Report display safety (Unicode spoofing)** — OPEN. `_ansi_safe` does NOT touch
-  Unicode bidirectional-override / zero-width codepoints (U+202A–202E, U+2066–2069,
-  U+200B, U+FEFF): they sit above `\x9f` and render natively in a terminal, so
-  proposal-controlled `metric`/`entity_id`/alias content can still visually reorder
-  or hide text a human reads on `report` (Trojan-Source class) with no escape byte.
-  Inert on honest fixtures today; close it when live extraction feeds `report`.
-- **I/J** — persisted conflict records; slug-collision detection strength.
-`validate.py` enforces a per-DOCUMENT boundary only; cross-document trust is Class A.
+**The DB is derived state — the artifact fold (WS-2a, 2026-08-18 gate Challenge
+1).** `run_extract` persists each document's validated extraction as
+`data/raw/<file_sha256>.extraction.json` beside the raw blob (atomic write,
+provenance-stamped with `_extracted_at` + model/prompt sha). The SQLite DB is a
+deterministic FOLD over retained artifacts: `run_rebuild` replays
+`persist_extraction` for the latest artifact per doc_id (`_extracted_at` desc,
+sha tie-break) in `(ingest_date, doc_id)` order into a temp file, then atomically
+replaces the DB. **The fold replays `_extracted_at` order — the actual
+incremental chronology** — because reconciliation is first-writer-wins in every
+dimension (identity freeze, null-fill, alias ownership, conflict attribution);
+any other key silently re-decides every race on every rebuild (2026-08-18
+precommit gate, devils-advocate). An artifact folds only when a sidecar at the
+same sha256 binds the same doc_id — a CONSISTENCY check against the ingest
+record, NOT authentication: **write access to `data/raw/` is the trust
+boundary** (sidecar, blob, and artifact live in the same directory; a MAC keyed
+outside it is WS-2b+ scope). `forget <doc_id>` moves sidecar+artifact to
+`data/quarantine/` (never deletes — blobs stay, content-addressed), refolds,
+and FAILS LOUD if the doc_id survives the refold — the retraction primitive
+every flag-terminated defense resolves into, and it must never report success
+while retracting nothing. A revision (same doc_id, CHANGED bytes) is EXTRACTED
+and supersedes via refold (WS-1's deferred supersession: retired); an
+already-superseded byte-state re-offered is skipped (anti-ping-pong).
+Incremental state and rebuilt state must stay equal — tested, including with
+sha order deliberately opposing ingest_date order.
+
+**Cross-document TRUST (Class A) — RESOLVED at the WS-2 gate (2026-08-18) and
+enforced in WS-2a.** The gate record
+(`docs/reviews/2026-08-18-live-ingest-plan/resolution.md`) is authoritative for
+every decision; the *named hostile suite* (`tests/test_hostile.py`) plus the
+honest-corpus regression + flag budget are the enforcement. The prompt-injection
+surface remains defended as before (`DOC_OPEN`/`DOC_CLOSE` delimiter, per-document
+grounding, `test_injection_*`). Resolved and BUILT:
+- **K** — never-overwrite is UNIVERSAL: no tier ever overrides a non-null
+  attribute; a later differing value (any tier) writes an `attribute` conflict.
+  Null-fill stays first-non-null, tier-blind — the race a hostile early doc can
+  win becomes a *visible conflict* when the honest value arrives, never a silent
+  loss. `favored_tier` stays **tier-blind** (K3, ratified): suspect-ness is
+  self-declared by the claim's own document, so excluding suspects would punish
+  honest disclosure and reward concealment.
+- **G** — aliases are grounded (G1: must appear in the contributing document's
+  source text, case-insensitive; ungrounded → dropped at validate) and
+  collision-gated (G3: an incoming alias equal to another stored entity's
+  name/alias is not unioned — `alias_collision` conflict). Entity `name`/`vendor`
+  get presence-grounding at validate (fail-soft drop) — the first-writer identity
+  plant needs its identity to at least exist in its own document.
+- **H1** — `corroborated` requires the agreeing non-suspect members to span ≥2
+  distinct NORMALIZED publishers; single-publisher agreement demotes to
+  `weakly_corroborated` + `single_publisher`. Honestly an OPERATOR-diversity
+  floor (publishers come from watchlist config in WS-2b's direct-URL scope).
+- **Group-key hardening** — `metric`/`unit` are normalized (casefold+ws) in the
+  analyze group key; near-identical metric strings get the advisory
+  `possible_split_metric` flag.
+- **Sidecar identity binding** — `write_sidecar` refuses a doc_id-differing
+  overwrite (`SidecarCollision`); same-doc_id metadata refresh stays allowed.
+  Same-doc_id supersession: retired via the artifact fold (revisions extract and
+  supersede).
+- **Blob content-hash** — `read_raw_docs` recomputes each blob's sha256;
+  mismatches surface in `ExtractReport.errors`, never extracted.
+- **Content bounds** — every model/network-influenced string is bounded in
+  pydantic (length + charset) AND mirrored as SQLite length CHECKs (migration
+  0004; schema v4 `bounds` block). `cmp_baseline_entity` has a slug shape bound
+  (the FK stays dropped — dangling baselines remain legal and flagged).
+- **Report display safety** — `cli._ansi_safe` strips ANSI/OSC/control escapes
+  AND all Unicode category-Cf codepoints (bidi/zero-width/BOM — Trojan-Source
+  class, closed by category test, not enumeration). Every DB-derived display
+  string, including conflict `offered_value`/`stored_value`, routes through it.
+- **I** — conflict records are persisted (`entity_conflict`, migration 0004) —
+  see the persistence section above for the shape and the derive-on-read
+  distinction. **J** — slug collisions are an advisory analyze flag
+  (`possible_slug_collision`), deliberately never fail-loud (a fail-loud check
+  would let a hostile alias DoS honest ingestion).
+
+**Still DEFERRED, with named triggers (see docs/ROADMAP.md):** **H2** (all-tier-3
+confidence cap — trigger: watchlist carries ≥2 distinct tier-3 publishers for one
+metric); **B1** (baseline surface-form binding — CUT at the gate: near-empty
+true-positive surface; trigger: a demonstrated misattributed-measurement case);
+**controlled metric vocabulary** (trigger: real corpus shows split groups
+normalization can't close); **identity citation slots** for `name`/`vendor`/
+`entity_type` (trigger: schema v5); **Unicode confusables/homoglyph folding**
+(a Latin/Cyrillic/Greek lookalike swap defeats fold-based comparison in G3, H1,
+and J simultaneously — precommit gate, injection F2; trigger: the honest
+fixtures now exist, land it when a live corpus shows a homoglyph case, inside
+`textnorm.fold`); **display of `quote_span`/`stated_caveats` — OPEN** (stored
+VERBATIM by design, length-bounded only: raw escapes and Trojan-Source
+codepoints persist in DB and artifacts; `report` doesn't display them today,
+but any future evidence-display feature MUST route them through `_ansi_safe` —
+the "every DB-derived display string" guarantee covers currently-displayed
+fields only). Residual risks accepted at the gate: shell-publisher collusion
+passes H1; a tampered sidecar `file_sha256` FIELD (S2 verifies the blob against
+the filename hash only); an `_extracted_at` inside an artifact is
+attacker-writable text ordering the fold — bounded by the `data/raw/` trust
+boundary above.
+`validate.py` enforces a per-DOCUMENT boundary; cross-document trust lives in
+store reconciliation + analyze floors, tested by the hostile suite.
 
 ## Prompts and the schema are versioned artifacts, not edited in place
 A prompt change means a NEW file (`extract_foundry_v2.md`), so every extraction
@@ -148,8 +197,9 @@ later — so `extract` stays fetch-source-agnostic. The `Document` row is create
 **extract** time (`persist_extraction` inserts it, unchanged), not at ingest.
 `run_extract` classifies each sidecar against `store.stored_doc_shas` (doc_id →
 file_sha256): unknown doc_id → extract; same doc_id + same bytes → idempotent skip;
-same doc_id + CHANGED bytes → a source revision, surfaced loudly in
-`ExtractReport.revised` (never silently skipped) with supersession deferred. Each
+same doc_id + CHANGED bytes → a source revision — EXTRACTED and superseded via the
+artifact fold (WS-2a; reported in `ExtractReport.revised`), with an anti-ping-pong
+guard (an already-retained byte-state re-offered is an honest skip). Each
 document is fault-isolated — one bad sidecar lands in `ExtractReport.errors` and the
 batch continues. Alternatives considered and rejected for the MVP: a `pending_raw`
 DB table (needless migration; ingest stays DB-free) and an ingest-time Document with
@@ -162,15 +212,20 @@ environment (`ANTHROPIC_API_KEY`) at call time and is never committed. `data/` i
 gitignored in full.
 
 ## Module map
-- `ingest/`  — fetchers + content-addressed raw storage + provenance sidecars
-  (`ingest_file` operator path live; network fetch: WIP/WS-2)
-- `extract/` — raw doc → schema records via a versioned prompt; `run_extract` wires
-  ingest (sidecar) → extractor → `persist_extraction`
-- `store/`   — SQLite persistence + entity reconciliation; sole DB owner
-- `analyze/` — cross-source corroboration + divergence (v1: tolerance grouping,
-  suspect members excluded from the corroborated count, tier-blind `favored_tier`
-  on contradictions; derive-on-read, read-only over `store`)
-- `cli.py`   — thin argument layer over the above
+- `ingest/`  — fetchers + content-addressed raw storage + provenance sidecars +
+  extraction-artifact layout + `forget` quarantine (`ingest_file` operator path
+  live; network fetch: WS-2b)
+- `extract/` — raw doc → schema records via a versioned prompt; `run_extract`
+  wires ingest (sidecar) → extractor → `persist_extraction` + artifact;
+  `run_rebuild` refolds the DB from artifacts
+- `store/`   — SQLite persistence + conflict-recording entity reconciliation;
+  sole DB owner
+- `analyze/` — cross-source corroboration + divergence (tolerance grouping over
+  normalized keys, suspect members excluded from the corroborated count, H1
+  publisher floor, tier-blind `favored_tier` on contradictions, advisory flags,
+  conflict surfacing; derive-on-read, read-only over `store`)
+- `cli.py`   — thin argument layer over the above (`db init|rebuild`, `ingest`,
+  `ingest-file`, `extract`, `report`, `forget`)
 
 ## Testing (ENFORCE posture)
 `tests/` uses a golden-fixture harness: `tests/fixtures/<doc_id>/raw.pdf` +
@@ -182,7 +237,13 @@ never fabricates model output: the offline golden replays a real, provenance-
 stamped `llm_response.json` (skips until recorded via `--run-live --record`), and
 `test_validate.py` covers the validation pipeline deterministically. Never let a
 green offline run stand in for live coverage. Store/ingest/prompt have their own
-real tests.
+real tests. **WS-2a adds the named hostile suite** (`tests/test_hostile.py` +
+`tests/fixtures/hostile/`): constructed hostile documents through the REAL
+validate→persist→analyze→report chain — one named test per attack, never reusing
+the honest acceptance golden — paired with the **honest-corpus regression** (the
+analyze golden's verdicts/flags must not change except by written, approved
+diffs) and the **flag budget** (≤1 new flag per honest assessment per
+workstream; WS-2a shipped at zero).
 
 ## Review gates (swarm)
 Significant workstreams pass an adversarial review gate before commit: biased
