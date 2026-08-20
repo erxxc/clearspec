@@ -16,7 +16,12 @@ import sqlite3
 from pathlib import Path
 
 from ..config import Config, load_config
+from ..textnorm import CTRL_CLASS, fold
 from . import models
+
+# The schema's per-entity alias ceiling (v4 bounds: max_items 16) — pydantic
+# enforces it per document contribution; the reconcile union enforces it here.
+MAX_ALIASES_PER_ENTITY = 16
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
@@ -314,7 +319,7 @@ def _conflict_repr(value: object) -> str:
     return _CTRL_RE.sub(" ", str(value))[:120]
 
 
-_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CTRL_RE = re.compile(CTRL_CLASS)  # shared CLASS, local scrub semantics (textnorm)
 
 
 class StoreNotInitialized(RuntimeError):
@@ -331,14 +336,15 @@ def _translate_missing_schema(exc: sqlite3.OperationalError) -> Exception:
 
 
 def _foreign_surface_forms(conn: sqlite3.Connection, entity_id: str) -> set[str]:
-    """Every OTHER entity's surface forms (name + aliases), case-folded — one
-    query; the store is small enough that a full scan per reconcile is fine."""
+    """Every OTHER entity's surface forms (name + aliases), folded via the
+    SHARED textnorm.fold — one query; the store is small enough that a full
+    scan per reconcile is fine."""
     foreign: set[str] = set()
     for row in conn.execute(
         "SELECT name, aliases FROM entity WHERE entity_id != ?", (entity_id,)
     ):
-        foreign.add(row["name"].casefold())
-        foreign.update(a.casefold() for a in json.loads(row["aliases"]))
+        foreign.add(fold(row["name"]))
+        foreign.update(fold(a) for a in json.loads(row["aliases"]))
     return foreign
 
 
@@ -387,7 +393,7 @@ def reconcile_entity(conn: sqlite3.Connection, ent: models.Entity, doc_id: str) 
         kept: list[str] = []
         refused: list[str] = []
         for alias in ent.aliases:
-            if alias.casefold() != ent.name.casefold() and alias.casefold() in foreign:
+            if fold(alias) != fold(ent.name) and fold(alias) in foreign:
                 refused.append(alias)
             else:
                 kept.append(alias)
@@ -401,7 +407,9 @@ def reconcile_entity(conn: sqlite3.Connection, ent: models.Entity, doc_id: str) 
     # --- identity fields: compare case-folded; first writer wins (K1) ---
     for col in _IDENTITY_COLS:
         offered = _enum(getattr(ent, col))
-        if str(offered).casefold() != str(existing[col]).casefold():
+        # SHARED fold, not bare casefold: PDF text-layer noise ("TSMC " with a
+        # trailing space) is the same identity, never a spurious conflict.
+        if fold(str(offered)) != fold(str(existing[col])):
             insert_conflict(conn, _refusal(
                 models.ConflictKind.identity_field, ent.entity_id, doc_id,
                 col, existing[col], offered))
@@ -431,19 +439,32 @@ def reconcile_entity(conn: sqlite3.Connection, ent: models.Entity, doc_id: str) 
                 models.ConflictKind.attribute, ent.entity_id, doc_id,
                 col.replace("_", ".", 1), stored, offered))
 
-    # --- aliases: union, refusing cross-entity collisions (G3) ---
+    # --- aliases: union, refusing cross-entity collisions (G3) and enforcing
+    # --- the schema's per-entity ceiling at the true point of accumulation ---
     aliases = json.loads(existing["aliases"])
     if ent.aliases:
         foreign = _foreign_surface_forms(conn, ent.entity_id)
+        have = {fold(a) for a in aliases}  # folded membership: a case/space variant is a re-offer
         for alias in ent.aliases:
-            if alias in aliases:
+            f = fold(alias)
+            if f in have:
                 continue  # already unioned — an equal re-offer, not a conflict
-            if alias.casefold() in foreign:
+            if f in foreign:
                 insert_conflict(conn, _refusal(
                     models.ConflictKind.alias_collision, ent.entity_id, doc_id,
                     "alias", None, alias))
+            elif len(aliases) >= MAX_ALIASES_PER_ENTITY:
+                # The schema's 16-item bound is a PER-ENTITY invariant; pydantic
+                # only sees one document's contribution, so the union here is
+                # the real enforcement point. Refuse the alias — never the
+                # document (a fail-closed DDL under a fail-soft model layer is
+                # the posture inversion the precommit gate rejected).
+                insert_conflict(conn, _refusal(
+                    models.ConflictKind.alias_overflow, ent.entity_id, doc_id,
+                    "alias", None, alias))
             else:
                 aliases.append(alias)
+                have.add(f)
 
     set_cols += ["aliases = ?", "attribute_citations = ?"]
     params += [json.dumps(aliases), json.dumps(attr_cites), ent.entity_id]

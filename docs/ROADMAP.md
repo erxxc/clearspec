@@ -88,13 +88,20 @@ from the Class A list here + in CLAUDE.md.
   injection-live-in-WS-1 framing + add a wiring injection test) and applied; per-doc
   fault isolation added. Gate outcome: **proceed**.
 
-### WS-2 — Live ingest (network fetch) + Class A trust model — **WS-2a BUILT (this branch, precommit gate pending); WS-2b NEXT**
+### WS-2 — Live ingest (network fetch) + Class A trust model — **WS-2a BUILT + PRECOMMIT GATE PASSED (2026-08-18, conditions applied); WS-2b NEXT**
 
-Status 2026-08-18: step 1 (sparsity grounding + vendor case-fold) merged-ready as
-its own PR; step 2 (WS-2a trust hardening, everything below) built on
-`feat/ws2a-trust` with the hostile suite + honest-corpus regression + flag
-budget; step 3 (WS-2b fetcher) not started. CLAUDE.md's Class A section now
-records the resolved set; the deferred items keep their named triggers.
+Status: step 1 (sparsity grounding + vendor case-fold) shipped as its own PR;
+step 2 (WS-2a trust hardening) built on `feat/ws2a-trust`, verified by appsec
+review + operator UAT + the named hostile suite (23 cases incl. honest-path
+guards), and passed the precommit swarm gate
+(`docs/reviews/2026-08-18-live-ingest-precommit/` — 3× conditional + a
+devils-advocate challenge that found the fold-order divergence and the silent
+non-retraction hole; all adjudicated conditions applied before commit: fold
+replays `_extracted_at` chronology, forget post-condition, sidecar binding as
+consistency-not-authentication, JSON CHECKs sized to accumulated escaped worst
+case + alias_overflow at merge, shared `textnorm.fold`, honest fixtures added).
+Suite: offline 119/3, live 122/0. Step 3 (WS-2b fetcher) not started —
+next workstream, on the hardened, retractable, order-coherent store.
 
 Trust-model design gate run at `docs/reviews/2026-08-18-live-ingest-plan/`
 (3× conditional + devils-advocate challenge; four forks adjudicated by the

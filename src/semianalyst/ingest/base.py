@@ -166,6 +166,20 @@ def extraction_artifact_path(raw_dir: Path, sha256: str) -> Path:
     return raw_dir / f"{sha256}{EXTRACTION_SUFFIX}"
 
 
+def sidecar_doc_id(raw_dir: Path, sha256: str) -> str | None:
+    """The doc_id the ingest sidecar binds to this content hash, or None when
+    the sidecar is missing or unreadable. The fold uses this as a CONSISTENCY
+    check (an artifact folds only when the ingest record agrees on its
+    identity) — it is not authentication: sidecar and artifact live in the same
+    directory, and write access to data/raw/ is the trust boundary (CLAUDE.md)."""
+    try:
+        meta = json.loads((raw_dir / f"{sha256}{SIDECAR_SUFFIX}").read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    doc_id = meta.get("doc_id")
+    return doc_id if isinstance(doc_id, str) else None
+
+
 def write_extraction_artifact(raw_dir: Path, sha256: str, artifact: dict) -> Path:
     """Persist a document's validated extraction beside its blob (atomic, like
     the sidecar). Content-addressed by the SOURCE bytes' sha256 — one artifact

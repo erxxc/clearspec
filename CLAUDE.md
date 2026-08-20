@@ -25,7 +25,12 @@ documented the extraction-artifact fold.
   isn't a (whitespace-normalized) substring of the source, and nulls any entity
   attribute whose `attribute_citations` entry isn't grounded (v2). The LLM output
   is a PROPOSAL; validation is the guarantee. `location_type` fails safe to
-  `unknown` under flat-text extraction (never laundered to `body`).
+  `unknown` under flat-text extraction (never laundered to `body`). **Grounding
+  is a FIDELITY boundary, not a trust boundary** (2026-08-18 precommit gate): it
+  proves the model didn't fabricate *relative to the document* — and the
+  document is adversary-authored, so a hostile PDF can ground anything it
+  chooses to print. Trust comes from the cross-document layer: provenance,
+  conflict records, H1, tiers — never from grounding alone.
 - **Relative claims are never converted to absolutes.** Store the ratio and the
   baseline reference (`comparison.is_relative`, `comparison.baseline_entity`) so
   the distortion stays visible. "2.5x faster" is stored as `2.5` + baseline, not
@@ -82,12 +87,23 @@ provenance-stamped with `_extracted_at` + model/prompt sha). The SQLite DB is a
 deterministic FOLD over retained artifacts: `run_rebuild` replays
 `persist_extraction` for the latest artifact per doc_id (`_extracted_at` desc,
 sha tie-break) in `(ingest_date, doc_id)` order into a temp file, then atomically
-replaces the DB. `forget <doc_id>` moves sidecar+artifact to `data/quarantine/`
-(never deletes — blobs stay, content-addressed) and refolds — the retraction
-primitive every flag-terminated defense resolves into. A revision (same doc_id,
-CHANGED bytes) is now EXTRACTED and supersedes via refold (WS-1's deferred
-supersession: retired); an already-superseded byte-state re-offered is skipped
-(anti-ping-pong). Incremental state and rebuilt state must stay equal — tested.
+replaces the DB. **The fold replays `_extracted_at` order — the actual
+incremental chronology** — because reconciliation is first-writer-wins in every
+dimension (identity freeze, null-fill, alias ownership, conflict attribution);
+any other key silently re-decides every race on every rebuild (2026-08-18
+precommit gate, devils-advocate). An artifact folds only when a sidecar at the
+same sha256 binds the same doc_id — a CONSISTENCY check against the ingest
+record, NOT authentication: **write access to `data/raw/` is the trust
+boundary** (sidecar, blob, and artifact live in the same directory; a MAC keyed
+outside it is WS-2b+ scope). `forget <doc_id>` moves sidecar+artifact to
+`data/quarantine/` (never deletes — blobs stay, content-addressed), refolds,
+and FAILS LOUD if the doc_id survives the refold — the retraction primitive
+every flag-terminated defense resolves into, and it must never report success
+while retracting nothing. A revision (same doc_id, CHANGED bytes) is EXTRACTED
+and supersedes via refold (WS-1's deferred supersession: retired); an
+already-superseded byte-state re-offered is skipped (anti-ping-pong).
+Incremental state and rebuilt state must stay equal — tested, including with
+sha order deliberately opposing ingest_date order.
 
 **Cross-document TRUST (Class A) — RESOLVED at the WS-2 gate (2026-08-18) and
 enforced in WS-2a.** The gate record
@@ -142,9 +158,20 @@ metric); **B1** (baseline surface-form binding — CUT at the gate: near-empty
 true-positive surface; trigger: a demonstrated misattributed-measurement case);
 **controlled metric vocabulary** (trigger: real corpus shows split groups
 normalization can't close); **identity citation slots** for `name`/`vendor`/
-`entity_type` (trigger: schema v5). Residual risks accepted at the gate:
-shell-publisher collusion passes H1; a tampered sidecar `file_sha256` FIELD (S2
-verifies the blob against the filename hash only).
+`entity_type` (trigger: schema v5); **Unicode confusables/homoglyph folding**
+(a Latin/Cyrillic/Greek lookalike swap defeats fold-based comparison in G3, H1,
+and J simultaneously — precommit gate, injection F2; trigger: the honest
+fixtures now exist, land it when a live corpus shows a homoglyph case, inside
+`textnorm.fold`); **display of `quote_span`/`stated_caveats` — OPEN** (stored
+VERBATIM by design, length-bounded only: raw escapes and Trojan-Source
+codepoints persist in DB and artifacts; `report` doesn't display them today,
+but any future evidence-display feature MUST route them through `_ansi_safe` —
+the "every DB-derived display string" guarantee covers currently-displayed
+fields only). Residual risks accepted at the gate: shell-publisher collusion
+passes H1; a tampered sidecar `file_sha256` FIELD (S2 verifies the blob against
+the filename hash only); an `_extracted_at` inside an artifact is
+attacker-writable text ordering the fold — bounded by the `data/raw/` trust
+boundary above.
 `validate.py` enforces a per-DOCUMENT boundary; cross-document trust lives in
 store reconciliation + analyze floors, tested by the hostile suite.
 

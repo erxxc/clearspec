@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel, ValidationError
 
 from ..store import models
+from ..textnorm import CTRL_CLASS, fold
 from .pdf import is_grounded
 
 logger = logging.getLogger(__name__)
@@ -105,7 +106,7 @@ GROUNDABLE: dict[str, list[str]] = {
 }
 _VALID_PATHS = {f"{sub}.{f}" for sub, fields in GROUNDABLE.items() for f in fields}
 
-_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+_CTRL = re.compile(CTRL_CLASS)  # shared CLASS, local scrub semantics (textnorm)
 
 # Sparse-benchmark vocabulary (v1, 2026-08-18 gate — injection F1, a live bug):
 # conditions.sparsity is model-proposed, and a hostile document can steer the
@@ -127,7 +128,7 @@ def _grounded_ci(text: str, source_text: str) -> bool:
     vendor, aliases), whose casing varies legitimately ("TSMC"/"Tsmc", same as
     the dedup key). Quote spans stay case-sensitive: they claim to be verbatim
     quotes; identity presence is an existence floor, not a quote."""
-    return is_grounded(text.lower(), source_text.lower())
+    return is_grounded(text.casefold(), source_text.casefold())
 
 
 def normalize_date_str(value: str) -> str:
@@ -256,9 +257,11 @@ def validate_proposal(
             else:
                 _force_unknown(ent.attribute_citations[path])
 
-        # Vendor is case-folded like name: one document's "TSMC"/"Tsmc" is one
-        # vendor, not two entities (2026-08-18 gate, schema-purist risk).
-        key = (ent.vendor.strip().lower(), ent.name.strip().lower())
+        # One document's "TSMC"/"Tsmc"/"TSMC " is one vendor, not two entities —
+        # the SHARED fold (textnorm), so dedup, reconcile, and analyze answer
+        # "same value?" identically (precommit gate: three drifting copies had
+        # shipped three different answers).
+        key = (fold(ent.vendor), fold(ent.name))
         if key in seen:
             base = seen[key]
             for alias in ent.aliases:

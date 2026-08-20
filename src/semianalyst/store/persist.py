@@ -36,8 +36,8 @@ def persist_extraction(
     Reconciliation refusals land in `entity_conflict` under this document's
     doc_id. Conflicts are a deterministic function of persist order and content:
     a rebuild (extract.run_rebuild) replays persist_extraction over retained
-    artifacts in the same (ingest_date, doc_id) order, so incremental conflicts
-    regenerate identically on refold — and conflicts attributed to forgotten or
+    artifacts in `_extracted_at` order — the actual incremental chronology — so
+    incremental conflicts regenerate identically on refold — and conflicts attributed to forgotten or
     superseded documents disappear with them. That is correct semantics: the
     conflict table describes the CURRENT fold, not an audit log of every write
     ever attempted (the quarantined artifact remains the durable record).

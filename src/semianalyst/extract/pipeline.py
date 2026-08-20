@@ -35,14 +35,16 @@ from ..ingest import (
     extraction_artifact_path,
     read_extraction_artifacts,
     read_raw_docs,
+    sidecar_doc_id,
     write_extraction_artifact,
 )
 from ..store import models
+from ..textnorm import CTRL_CLASS
 from .base import AnthropicExtractor, AnthropicModelClient
 from .prompts import PromptVersion
 from .validate import ExtractionResult
 
-_ERR_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+_ERR_CTRL = re.compile(CTRL_CLASS)  # shared CLASS, local scrub semantics (textnorm)
 
 
 def _err_repr(exc: Exception) -> str:
@@ -215,8 +217,12 @@ def run_rebuild(config: Config | None = None) -> RebuildReport:
 
     Per doc_id the LATEST artifact wins (_extracted_at desc; sha256 lexical as a
     deterministic tie-break). Winners replay through the unchanged
-    persist_extraction in (ingest_date, doc_id) order — the same first-doc-wins
-    reconciliation a fresh incremental run would produce. The fold lands in a
+    persist_extraction in `_extracted_at` order — the actual chronology the
+    incremental path persisted in, so first-writer races (identity freeze,
+    null-fill, alias ownership, conflict attribution) resolve identically on
+    refold. Artifacts are folded only when a matching sidecar binds them (same
+    sha256, same doc_id) — a CONSISTENCY check against the ingest record, not
+    authentication: write access to data/raw/ is the trust boundary (CLAUDE.md). The fold lands in a
     temp file and atomically replaces the configured db (os.replace), so a
     crashed rebuild never leaves a half-folded store. Per-artifact fault
     isolation mirrors run_extract: one bad artifact lands in `errors` and the
@@ -234,6 +240,14 @@ def run_rebuild(config: Config | None = None) -> RebuildReport:
         if not doc_id:
             errors.append((art.sha256, "artifact has no document.doc_id"))
             continue
+        # Sidecar binding (consistency, not authentication — see module doc):
+        # an artifact folds only when the ingest record at the same sha256
+        # agrees on its doc_id. This also makes forget's quarantine airtight —
+        # an orphaned artifact (sidecar quarantined, missing, or unreadable)
+        # can never resurrect a retracted document through the fold.
+        if sidecar_doc_id(config.paths.raw_dir, art.sha256) != doc_id:
+            errors.append((art.sha256, "artifact without a matching sidecar binding — not folded"))
+            continue
         by_doc.setdefault(doc_id, []).append(art)
 
     winners: list[tuple[str, object]] = []
@@ -243,9 +257,13 @@ def run_rebuild(config: Config | None = None) -> RebuildReport:
         winners.append((doc_id, arts[-1]))
         if len(arts) > 1:
             superseded.append(doc_id)
-    # Deterministic replay order — (ingest_date, doc_id), NOT filesystem order —
-    # so a rebuilt store reconciles entities exactly as the incremental one did.
-    winners.sort(key=lambda w: (str(w[1].data["document"].get("ingest_date") or ""), w[0]))
+    # Deterministic replay order — `_extracted_at` (the actual extraction
+    # chronology), NOT ingest_date and NOT filesystem order. Reconciliation is
+    # first-writer-wins in every dimension (identity freeze, null-fill, G3
+    # alias ownership, conflict attribution), so the fold must replay the SAME
+    # history the incremental path wrote — any other key silently re-decides
+    # every race on every rebuild (precommit gate, devils-advocate §1).
+    winners.sort(key=lambda w: (str(w[1].data.get("_extracted_at") or ""), w[0]))
 
     db_path = config.paths.db_path
     tmp_path = db_path.with_name(db_path.name + ".rebuild")

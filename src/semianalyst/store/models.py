@@ -233,6 +233,7 @@ class ConflictKind(str, enum.Enum):
     identity_field = "identity_field"    # later doc differs on frozen vendor/name/entity_type
     attribute = "attribute"              # later doc differs on a non-null node/chip attribute (K1/K2)
     alias_collision = "alias_collision"  # incoming alias equals another entity's name/alias (G3)
+    alias_overflow = "alias_overflow"    # union would exceed the per-entity alias ceiling (v4 bounds)
 
 
 class Conflict(BaseModel):

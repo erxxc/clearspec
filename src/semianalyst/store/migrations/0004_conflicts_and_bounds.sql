@@ -17,6 +17,26 @@
 --     transaction, so the PRAGMAs below take effect.
 --
 -- Carry-forward lists every surviving column explicitly (no SELECT *).
+--
+-- CARRY-FORWARD CAVEAT (precommit gate, schema-purist F1): the INSERT..SELECT
+-- evaluates the new CHECKs on every pre-existing row. A pre-v4 store holding a
+-- value beyond a bound (an over-long quote_span, url, metric, ...) FAILS LOUD
+-- and the whole migration rolls back — the store is left intact on v3, never
+-- half-migrated (the swap runs inside one transaction). Triage before retrying:
+--   SELECT claim_id  FROM claim    WHERE length(cite_quote_span) > 2000
+--                                     OR length(metric) > 120 OR length(unit) > 16;
+--   SELECT doc_id    FROM document WHERE length(url) > 2000 OR length(title) > 300;
+--   SELECT entity_id FROM entity   WHERE length(aliases) > 8000;
+-- Fail-loud is deliberate: silently truncating stored evidence would mutate
+-- exactly the verbatim provenance this schema exists to preserve.
+--
+-- JSON-FIELD BOUNDS RULE (precommit gate, schema-purist F2 / devils-advocate
+-- §5): a CHECK on a JSON column bounds the SERIALIZED form, so it must be >=
+-- the worst-case serialization of the maximum ACCUMULATED pydantic-legal value
+-- (json.dumps escapes each char up to 6 bytes: aliases 16x80x6 -> 8000;
+-- stated_caveats 16x500x6 -> 50000). These are pure flood guards; the real
+-- invariants (item counts, per-item lengths) are enforced at the model layer
+-- and, for the cross-document alias union, at reconcile (alias_overflow).
 
 PRAGMA foreign_keys = OFF;
 BEGIN;
@@ -53,7 +73,7 @@ CREATE TABLE entity_v4 (
                             ('process_node','chip','chiplet','package','ip_block')),
     vendor                TEXT NOT NULL CHECK (length(vendor) <= 80),
     name                  TEXT NOT NULL CHECK (length(name) <= 80),
-    aliases               TEXT NOT NULL DEFAULT '[]' CHECK (length(aliases) <= 1500),
+    aliases               TEXT NOT NULL DEFAULT '[]' CHECK (length(aliases) <= 8000),
     node_density_mtx_mm2  REAL,
     node_transistor_type  TEXT CHECK (node_transistor_type IN
                             ('finfet','gaa_nanosheet','cfet')),
@@ -99,7 +119,7 @@ CREATE TABLE claim_v4 (
     cond_precision        TEXT CHECK (cond_precision IS NULL OR length(cond_precision) <= 120),
     cond_sparsity         INTEGER,
     cond_thermal_config   TEXT CHECK (cond_thermal_config IS NULL OR length(cond_thermal_config) <= 120),
-    cond_stated_caveats   TEXT NOT NULL DEFAULT '[]' CHECK (length(cond_stated_caveats) <= 8500),
+    cond_stated_caveats   TEXT NOT NULL DEFAULT '[]' CHECK (length(cond_stated_caveats) <= 50000),
     completeness          TEXT NOT NULL CHECK (completeness IN
                             ('complete','missing_baseline',
                              'missing_conditions','marketing_only')),
@@ -125,7 +145,7 @@ CREATE INDEX IF NOT EXISTS idx_claim_class  ON claim(claim_class);
 CREATE TABLE entity_conflict (
     conflict_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     kind          TEXT NOT NULL CHECK (kind IN
-                    ('identity_field','attribute','alias_collision')),
+                    ('identity_field','attribute','alias_collision','alias_overflow')),
     entity_id     TEXT NOT NULL REFERENCES entity(entity_id),
     doc_id        TEXT NOT NULL REFERENCES document(doc_id),  -- the offender
     field         TEXT NOT NULL CHECK (length(field) <= 80),

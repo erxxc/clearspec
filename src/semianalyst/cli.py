@@ -40,6 +40,10 @@ app.add_typer(db_app, name="db")
 # OSC (ESC ] ... BEL/ST) first, then CSI/other ESC sequences, then any residual
 # control bytes (bare ESC and the C1 CSI introducer 0x9b) so a partial sequence
 # can't survive as a live escape.
+# Deliberately NOT consolidated into textnorm (2026-08-18 precommit gate): this
+# is terminal-sink encoding — wider range (\x7f-\x9f) plus the Unicode-Cf pass —
+# and pulling it into a shared library helper invites "aligning" it with the
+# store's scrub semantics in either direction. A web UI HTML-escapes instead.
 _ANSI_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _ANSI_CSI = re.compile(r"\x1b[@-_][0-?]*[ -/]*[@-~]")
 _CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")

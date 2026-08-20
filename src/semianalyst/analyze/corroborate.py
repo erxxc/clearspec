@@ -39,12 +39,12 @@ resolved or deferred per docs/reviews/2026-08-18-live-ingest-plan/resolution.md.
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
 from ..config import Config, load_config
+from ..textnorm import fold
 from ..store import (
     ClaimView,
     conflict_counts_by_entity,
@@ -67,14 +67,10 @@ _CONFIDENCE = {
     "uncorroborated": "none",
 }
 
-_WS = re.compile(r"\s+")
-
-
-def _norm_key(s: str) -> str:
-    """Normalize an attacker-influenceable free-text key component for grouping
-    and publisher comparison: whitespace collapse + strip + casefold. The same
-    folding G3 mandates for aliases — a casing/spacing variant is one value."""
-    return _WS.sub(" ", s).strip().casefold()
+# The SHARED fold (textnorm): grouping, the H1 publisher floor, and J's
+# surface-form intersection all answer "same value?" exactly as validate's
+# dedup key and reconcile's identity/alias compares do — one implementation.
+_norm_key = fold
 
 
 @dataclass

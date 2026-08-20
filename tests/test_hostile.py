@@ -897,3 +897,231 @@ def test_malformed_sidecar_is_isolated(tmp_config: Config, tmp_path: Path):
     rb = run_rebuild(tmp_config)
     assert rb.folded == ["g1_doc"]
     assert any("unreadable extraction artifact" in reason for _, reason in rb.errors)
+
+
+# ---------------------------------------------------------------------------
+# 14. fold-order coherence (precommit gate, devils-advocate §1): the fold must
+#     replay the ACTUAL incremental chronology, proven with adversarial order
+# ---------------------------------------------------------------------------
+class _RouterClient:
+    """Replay client that routes proposals by a marker in the document text —
+    lets one run_extract batch carry per-document proposals."""
+
+    def __init__(self, routes: dict[str, dict]):
+        self.routes = routes
+
+    def complete(self, system: str, document_text: str) -> str:
+        for marker, proposal in self.routes.items():
+            if marker in document_text:
+                return json.dumps(proposal)
+        raise AssertionError("no route matched document text")
+
+
+def test_fold_order_matches_incremental_history(tmp_config: Config, tmp_path: Path):
+    """Two docs in ONE extract batch, sha256 order DELIBERATELY OPPOSING
+    ingest_date order, racing on an identity field. The fold replays
+    `_extracted_at` — the actual incremental chronology — so the rebuilt store
+    (winner, conflict attribution) must equal the incremental one. Under the
+    rejected (ingest_date, doc_id) fold key this test fails: the rebuild would
+    re-decide the race in favor of the earlier-ingest_date doc."""
+    store.init_db(tmp_config)
+    # Craft PDFs until the LATER-ingest_date doc sorts FIRST by sha256 (the
+    # incremental processing order) — the adversarial arrangement.
+    for i in range(200):
+        pdf_late = _mini_pdf([f"DOCA Acme Q1 brief variant {i}.", "Q1 by Acme."])
+        pdf_early = _mini_pdf([f"DOCB Acmex Q1 review variant {i}.", "Q1 by Acmex."])
+        sha_late = hashlib.sha256(pdf_late).hexdigest()
+        sha_early = hashlib.sha256(pdf_early).hexdigest()
+        if sha_late < sha_early:
+            break
+    assert sha_late < sha_early, "could not craft opposing orders"
+    (tmp_path / "late.pdf").write_bytes(pdf_late)
+    (tmp_path / "early.pdf").write_bytes(pdf_early)
+    ingest_file(tmp_config, tmp_path / "late.pdf", doc_id="late_doc", title="t",
+                publisher="Acme", doc_type="vendor_whitepaper", source_tier=3,
+                url="https://example.test/late", ingest_date="2026-01-02")
+    ingest_file(tmp_config, tmp_path / "early.pdf", doc_id="early_doc", title="t",
+                publisher="Acmex", doc_type="vendor_whitepaper", source_tier=3,
+                url="https://example.test/early", ingest_date="2026-01-01")
+
+    routes = {
+        "DOCA": {"entities": [_pe("acme_q1", "Acme", "Q1", entity_type="chip")], "claims": []},
+        "DOCB": {"entities": [_pe("acme_q1", "Acmex", "Q1", entity_type="chip")], "claims": []},
+    }
+    run_extract(tmp_config, extractor=AnthropicExtractor(_RouterClient(routes)))
+
+    conn = store.connect(tmp_config.paths.db_path)
+    try:
+        incremental_vendor = conn.execute(
+            "SELECT vendor FROM entity WHERE entity_id = 'acme_q1'").fetchone()["vendor"]
+        incremental_conflicts = _conflict_keys(conn)
+        # sha order processed late_doc (Acme) first -> it owns the identity;
+        # early_doc's differing vendor is the recorded offer.
+        assert incremental_vendor == "Acme"
+        assert incremental_conflicts == [
+            ("identity_field", "acme_q1", "early_doc", "vendor", "Acme", "Acmex")]
+    finally:
+        conn.close()
+
+    from semianalyst.extract import run_rebuild
+    rb = run_rebuild(tmp_config)
+    assert sorted(rb.folded) == ["early_doc", "late_doc"] and rb.errors == []
+    conn = store.connect(tmp_config.paths.db_path)
+    try:
+        assert conn.execute(
+            "SELECT vendor FROM entity WHERE entity_id = 'acme_q1'"
+        ).fetchone()["vendor"] == incremental_vendor
+        assert _conflict_keys(conn) == incremental_conflicts
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 15. artifact orphaning + forget post-condition (devils-advocate §3)
+# ---------------------------------------------------------------------------
+def test_orphaned_artifact_never_folds(tmp_config: Config, tmp_path: Path):
+    """An artifact whose sidecar is missing (or quarantined, or unreadable) must
+    NOT fold — the sidecar binding is the consistency check that closes the
+    resurrection path: a 'forgotten' document's leftover artifact can never
+    ride a refold back into the store."""
+    src = tmp_path / "doc.pdf"
+    src.write_bytes(_mini_pdf(["Vendor R doc.", "R1 by Vendor R."]))
+    store.init_db(tmp_config)
+    raw = ingest_file(tmp_config, src, doc_id="r1_doc", title="t", publisher="Vendor R",
+                      doc_type="vendor_whitepaper", source_tier=3,
+                      url="https://example.test/r1", ingest_date="2026-01-01")
+    proposal = {"entities": [_pe("vendorr_r1", "Vendor R", "R1")], "claims": []}
+    run_extract(tmp_config, extractor=AnthropicExtractor(ReplayModelClient(json.dumps(proposal))))
+
+    (tmp_config.paths.raw_dir / f"{raw.sha256}.meta.json").unlink()  # orphan the artifact
+
+    from semianalyst.extract import run_rebuild
+    rb = run_rebuild(tmp_config)
+    assert rb.folded == []
+    assert any("matching sidecar binding" in reason for _, reason in rb.errors)
+
+
+def test_forget_postcondition_fails_loud(tmp_config: Config, tmp_path: Path, monkeypatch):
+    """Belt-and-suspenders for the binding check: if ANY path ever lets the
+    forgotten doc_id survive the refold, forget must raise — a retraction that
+    reports success while retracting nothing is the worst outcome."""
+    src = tmp_path / "doc.pdf"
+    src.write_bytes(_mini_pdf(["Vendor S doc.", "S1 by Vendor S."]))
+    store.init_db(tmp_config)
+    ingest_file(tmp_config, src, doc_id="s1_doc", title="t", publisher="Vendor S",
+                doc_type="vendor_whitepaper", source_tier=3,
+                url="https://example.test/s1", ingest_date="2026-01-01")
+    proposal = {"entities": [_pe("vendors_s1", "Vendor S", "S1")], "claims": []}
+    run_extract(tmp_config, extractor=AnthropicExtractor(ReplayModelClient(json.dumps(proposal))))
+
+    from semianalyst.extract import pipeline as extract_pipeline
+
+    def _resurrecting_rebuild(config):
+        return extract_pipeline.RebuildReport(folded=["s1_doc"])
+
+    monkeypatch.setattr(extract_pipeline, "run_rebuild", _resurrecting_rebuild)
+    with pytest.raises(RuntimeError, match="retraction failed"):
+        forget(tmp_config, "s1_doc")
+
+
+# ---------------------------------------------------------------------------
+# 16. alias_overflow — the per-entity ceiling enforced at the point of
+#     accumulation (devils-advocate §5: refuse the alias, never the document)
+# ---------------------------------------------------------------------------
+def test_alias_union_ceiling_refuses_alias_not_document(tmp_config: Config):
+    """ATTACK: hostile docs saturate a victim entity's alias budget so later
+    honest contributions wedge. The union caps at 16 per entity: the 17th
+    distinct alias is refused with an alias_overflow conflict — and the
+    offering document's claims still persist (fail-soft, never fail-closed)."""
+    conn = _conn(tmp_config)
+    try:
+        first15 = [f"AX{i}" for i in range(15)]
+        src1 = "Vendor V V1 " + " ".join(first15)
+        _persist_validated(conn, _doc("d1", publisher="V", tier=3), {
+            "entities": [_pe("v_v1", "Vendor V", "V1", aliases=first15)],
+            "claims": [],
+        }, src1)  # stored: pinned name V1 + 15 = 16 aliases (the ceiling)
+
+        src2 = "Vendor V V1 AX99 reaches 10 GB/s."
+        _persist_validated(conn, _doc("d2", publisher="V", tier=3), {
+            "entities": [_pe("v_v1", "Vendor V", "V1", aliases=["AX99"])],
+            "claims": [_pc("c1", "d2", "v_v1", metric="bw", value=10.0,
+                           quote="V1 AX99 reaches 10 GB/s.")],
+        }, src2)
+        conn.commit()
+
+        assert len(_aliases(conn, "v_v1")) == 16
+        assert "AX99" not in _aliases(conn, "v_v1")
+        assert ("alias_overflow", "v_v1", "d2", "alias", None, "AX99") in _conflict_keys(conn)
+        assert conn.execute("SELECT COUNT(*) AS n FROM claim").fetchone()["n"] == 1  # doc survived
+    finally:
+        conn.close()
+
+
+def test_escaped_caveats_persist_on_honest_path(tmp_config: Config):
+    """Regression for the serialized-JSON CHECK sizing (schema-purist F2): 16
+    quote-heavy ~500-char caveats — pydantic-legal, escape-inflated — must
+    persist; the old 8500 CHECK rejected them and rolled back the document."""
+    caveat = ('"iso-power" and "2:1 ratio" quoted terms, ' * 12)[:498]
+    src = "Vendor W W1 reaches 10 GB/s."
+    conn = _conn(tmp_config)
+    try:
+        c = _pc("c1", "d1", "w_w1", metric="bw", value=10.0, quote="W1 reaches 10 GB/s.")
+        c["conditions"] = {"stated_caveats": [caveat] * 16}
+        _persist_validated(conn, _doc("d1", publisher="W", tier=3), {
+            "entities": [_pe("w_w1", "Vendor W", "W1")], "claims": [c],
+        }, src)
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) AS n FROM claim").fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 17. the two honest fixtures the acceptance guard lacked (devils-advocate §6)
+# ---------------------------------------------------------------------------
+def test_honest_shared_surface_form_records_the_cost(tmp_config: Config):
+    """HONEST-PATH fixture: two vendors legitimately share a marketing term
+    ("2nm-class"). G3 refuses the second union by design — this test pins the
+    acknowledged COST of that refusal on honest data: one alias_collision
+    conflict + identity_conflict flag, and nothing else (no drops, no crash)."""
+    conn = _conn(tmp_config)
+    try:
+        _persist_validated(conn, _doc("d1", publisher="TSMC", tier=2), {
+            "entities": [_pe("tsmc_n2", "TSMC", "N2", entity_type="process_node",
+                             aliases=["2nm-class"])],
+            "claims": [],
+        }, "TSMC N2 is a 2nm-class node.")
+        _persist_validated(conn, _doc("d2", publisher="Samsung", tier=2), {
+            "entities": [_pe("samsung_sf2", "Samsung", "SF2", entity_type="process_node",
+                             aliases=["2nm-class"])],
+            "claims": [],
+        }, "Samsung SF2 is a 2nm-class node.")
+        conn.commit()
+        assert _aliases(conn, "tsmc_n2") == ["N2", "2nm-class"]
+        assert _aliases(conn, "samsung_sf2") == ["SF2"]  # second union refused
+        assert _conflict_keys(conn) == [
+            ("alias_collision", "samsung_sf2", "d2", "alias", None, "2nm-class")]
+    finally:
+        conn.close()
+
+
+def test_honest_casing_whitespace_variants_no_spurious_conflict(tmp_config: Config):
+    """HONEST-PATH fixture: PDF text-layer noise — the second doc re-describes
+    the same entity with ' tsmc ' / 'n2 ' identity variants. Under the shared
+    fold this is the SAME identity: no identity_field conflict may fire (the
+    pre-fold bare-casefold compare minted one for a trailing space)."""
+    conn = _conn(tmp_config)
+    try:
+        _persist_validated(conn, _doc("d1", publisher="TSMC", tier=2), {
+            "entities": [_pe("tsmc_n2", "TSMC", "N2", entity_type="process_node")],
+            "claims": [],
+        }, "TSMC N2 enters production.")
+        _persist_validated(conn, _doc("d2", publisher="Press", tier=1), {
+            "entities": [_pe("tsmc_n2", " tsmc ", "N2", entity_type="process_node")],
+            "claims": [],
+        }, "Coverage of tsmc N2 production.")
+        conn.commit()
+        assert _conflict_keys(conn) == []  # same identity, zero conflict noise
+    finally:
+        conn.close()

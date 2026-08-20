@@ -36,7 +36,7 @@
 # ---------------------------------------------------------------
 conflict:
   conflict_id: int            # surrogate (AUTOINCREMENT)
-  kind: enum                  # [identity_field, attribute, alias_collision]
+  kind: enum                  # [identity_field, attribute, alias_collision, alias_overflow]
                               #   identity_field: later doc differs on frozen
                               #     vendor/name/entity_type (first writer wins,
                               #     difference recorded — never silently dropped)
@@ -44,6 +44,10 @@ conflict:
                               #     node/chip attribute (K1/K2: never overwritten)
                               #   alias_collision: incoming alias equals another
                               #     stored entity's name/alias (G3: not unioned)
+                              #   alias_overflow: the cross-document union would
+                              #     exceed the per-ENTITY alias ceiling — the
+                              #     alias is refused, never the document
+                              #     (precommit gate: fail-soft over fail-closed)
   entity_id: ref              # the entity the write targeted (FK)
   doc_id: ref                 # the OFFENDING document (FK)
   field: str                  # <=80 — identity field name, attribute path, or 'alias'
@@ -69,6 +73,14 @@ bounds:
     vendor: {max: 80, no_control_chars: true}
     name: {max: 80, no_control_chars: true}
     aliases: {max_items: 16, item_max: 80, no_control_chars: true}
+      # max_items is BOTH a per-document-contribution bound (pydantic) AND a
+      # per-entity union ceiling enforced at reconcile — an over-ceiling alias
+      # is refused with an alias_overflow conflict (precommit gate). The DDL
+      # CHECK on the serialized JSON column is sized to the worst-case ESCAPED
+      # serialization of the max accumulated legal value (16x80x6 -> 8000;
+      # stated_caveats 16x500x6 -> 50000) — a pure flood guard, never the
+      # invariant itself (a serialized-form CHECK tighter than worst-case
+      # escaping rejects honest data — schema-purist F2).
   claim:
     claim_id: {max: 200, pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"}
     metric: {max: 120, no_control_chars: true}

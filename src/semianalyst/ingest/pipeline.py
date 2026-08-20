@@ -147,4 +147,13 @@ def forget(config: Config, doc_id: str) -> ForgetReport:
     # top-level import here would be circular. At call time both are loaded.
     from ..extract.pipeline import run_rebuild
 
-    return ForgetReport(doc_id=doc_id, quarantined=quarantined, rebuild=run_rebuild(config))
+    rebuild = run_rebuild(config)
+    # Post-condition: retraction that did not retract is a hard failure, never a
+    # success report (precommit gate, devils-advocate §3 — an orphaned or
+    # resurrected artifact must not silently survive the refold).
+    if doc_id in rebuild.folded:
+        raise RuntimeError(
+            f"retraction failed: {doc_id!r} survived the refold — an artifact for "
+            f"it still folds; inspect data/raw/ and quarantine it manually"
+        )
+    return ForgetReport(doc_id=doc_id, quarantined=quarantined, rebuild=rebuild)
