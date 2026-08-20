@@ -74,13 +74,24 @@ def db_init() -> None:
 
 @app.command()
 def ingest() -> None:
-    """Fetch sources from the watchlist and store raw docs content-addressed by sha256."""
+    """Fetch configured document URLs from the watchlist and store raw docs
+    content-addressed by sha256 (with provenance sidecars)."""
     report = run_ingest(load_config())
     if report.note:
         typer.echo(report.note)
-    typer.echo(f"fetched: {len(report.fetched)}  skipped: {len(report.skipped)}")
+    typer.echo(
+        f"fetched: {len(report.fetched)}  unchanged: {len(report.unchanged)}  "
+        f"skipped: {len(report.skipped)}  errors: {len(report.errors)}"
+    )
+    for doc_id in report.fetched:
+        typer.echo(f"  fetched: {_ansi_safe(doc_id)}")
+    for doc_id in report.unchanged:
+        typer.echo(f"  unchanged (identical bytes already stored): {_ansi_safe(doc_id)}")
     for name in report.skipped:
-        typer.echo(f"  skipped: {name}")
+        typer.echo(f"  skipped (no documents configured): {_ansi_safe(name)}")
+    for key, reason in report.errors:
+        # key/reason can embed server-influenced strings (hop URLs) — sanitize.
+        typer.echo(f"  ERROR {_ansi_safe(key)}: {_ansi_safe(reason)}")
 
 
 @app.command("ingest-file")

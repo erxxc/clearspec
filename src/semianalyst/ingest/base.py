@@ -14,7 +14,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Callable, Protocol
 
 # A raw blob is stored at raw_dir/<sha256> (no suffix). Its provenance sidecar —
 # the metadata needed to build a Document at extract time — lives beside it at
@@ -46,6 +46,8 @@ class SourceRef:
     url: str
     doc_type: str
     source_tier: int
+    publisher: str | None = None     # sidecar publisher; run_ingest falls back to `name`
+    documents: tuple[str, ...] = ()  # explicit document URLs (WS-2b direct-URL scope; HTML discovery is WS-3)
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,21 @@ class RawRef:
     sha256: str
     path: Path
     is_new: bool  # False when the identical bytes were already stored (idempotent no-op)
+
+
+@dataclass(frozen=True)
+class FetchOutcome:
+    """One configured document URL's fetch result — success XOR error, never
+    both. `requested_url` is the operator-typed identity from config;
+    `final_url` is the post-redirect URL (audit trail; None when the transport
+    never completed); `raw` is set only on success, `error` is a fixed-text
+    reason on failure (per-document fault isolation — one bad URL never aborts
+    a source's batch)."""
+
+    requested_url: str
+    final_url: str | None = None
+    raw: RawRef | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -213,12 +230,20 @@ def read_extraction_artifacts(raw_dir: Path) -> tuple[list[ExtractionArtifact], 
 
 
 class Fetcher(Protocol):
-    """A source-specific fetcher.
+    """A source-specific fetcher (WS-2b shape: per-document outcomes).
 
-    Implementations turn a SourceRef into raw bytes (HTTP, file, etc.) and use
-    `store_raw` to persist them idempotently. Network fetch is not implemented
-    this phase — see foundry.py.
+    Implementations fetch each URL in `source.documents` and pass accepted
+    bytes through `store_raw`, so re-fetching unchanged bytes is a no-op and
+    changed bytes at the same URL become a new blob (revision detection
+    downstream in run_extract). Each document is fault-isolated: a failure is
+    an outcome carrying `error`, never an exception that sinks the source.
+    `pace` MUST be called before every network request — run_ingest supplies
+    it to enforce the configured rate limit across the whole run. Sidecar
+    identity (doc_id, provenance) is NOT the fetcher's job; run_ingest derives
+    it from each outcome's requested/final URLs.
     """
 
-    def fetch(self, source: SourceRef) -> Iterable[RawRef]:
+    def fetch(
+        self, source: SourceRef, raw_dir: Path, *, pace: Callable[[], None]
+    ) -> list[FetchOutcome]:
         ...

@@ -4,6 +4,7 @@ from .base import (
     EXTRACTION_SUFFIX,
     SIDECAR_SUFFIX,
     ExtractionArtifact,
+    FetchOutcome,
     Fetcher,
     RawDoc,
     RawRef,
@@ -17,13 +18,22 @@ from .base import (
     write_extraction_artifact,
     write_sidecar,
 )
+from .fetch import FetchedDoc, FetchError, fetch_url, looks_like_pdf
 from .foundry import FoundryFetcher
-from .pipeline import ForgetReport, IngestReport, forget, ingest_file, run_ingest
+from .pipeline import (
+    ForgetReport,
+    IngestReport,
+    forget,
+    ingest_file,
+    run_ingest,
+    url_doc_id,
+)
 
 __all__ = [
     "EXTRACTION_SUFFIX",
     "SIDECAR_SUFFIX",
     "ExtractionArtifact",
+    "FetchOutcome",
     "Fetcher",
     "RawDoc",
     "RawRef",
@@ -36,10 +46,15 @@ __all__ = [
     "store_raw",
     "write_extraction_artifact",
     "write_sidecar",
+    "FetchedDoc",
+    "FetchError",
+    "fetch_url",
+    "looks_like_pdf",
     "FoundryFetcher",
     "ForgetReport",
     "IngestReport",
     "forget",
     "ingest_file",
     "run_ingest",
+    "url_doc_id",
 ]

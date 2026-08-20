@@ -54,6 +54,12 @@ class Source(BaseModel):
     url: str
     doc_type: str
     source_tier: int
+    # Sidecar publisher; ingest falls back to `name` when omitted (WS-2b).
+    publisher: str | None = None
+    # Explicit document URLs to fetch — the WS-2b direct-URL scope. Discovering
+    # documents from the index page at `url` is HTML-discovery work (WS-3).
+    # Defaults keep parsing backward-compatible with pre-WS-2b config files.
+    documents: tuple[str, ...] = ()
 
 
 class Config(BaseModel):
