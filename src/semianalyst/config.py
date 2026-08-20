@@ -10,7 +10,7 @@ import tomllib
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 # Repo root = two parents up from this file (src/semianalyst/config.py -> repo root).
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -44,8 +44,11 @@ class PathsConfig(BaseModel):
 
 class RateLimits(BaseModel):
     model_config = ConfigDict(frozen=True)
-    requests_per_minute: int = 10
-    max_concurrency: int = 2
+    # gt=0: run_ingest divides by this for its pacing interval, and rounding 0
+    # up to some rate would fetch FASTER than the operator configured — the
+    # wrong fail direction. Invalid config fails loud at load, not mid-run.
+    requests_per_minute: int = Field(default=10, gt=0)
+    max_concurrency: int = Field(default=2, gt=0)
 
 
 class Source(BaseModel):
@@ -54,6 +57,12 @@ class Source(BaseModel):
     url: str
     doc_type: str
     source_tier: int
+    # Sidecar publisher; ingest falls back to `name` when omitted (WS-2b).
+    publisher: str | None = None
+    # Explicit document URLs to fetch — the WS-2b direct-URL scope. Discovering
+    # documents from the index page at `url` is HTML-discovery work (WS-3).
+    # Defaults keep parsing backward-compatible with pre-WS-2b config files.
+    documents: tuple[str, ...] = ()
 
 
 class Config(BaseModel):

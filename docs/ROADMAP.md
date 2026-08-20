@@ -13,15 +13,15 @@ Keep this file honest on every workstream boundary: when a slice lands, move its
 row from *Open* to *Built*; when a Class A item is retired, strike it here and in
 CLAUDE.md in the same commit.
 
-_Last updated: 2026-08-18._
+_Last updated: 2026-08-20._
 
 ---
 
-## Current state — extract E2E is wired (WS-1); network fetch (WS-2) is the one remaining stub
+## Current state — the pipeline is wired end to end (WS-1 + WS-2); direct-URL network fetch is live
 
 | Stage | State | Notes |
 |---|---|---|
-| `ingest/` network fetch | **STUB (WS-2)** | `FoundryFetcher.fetch` → `NotImplementedError`; `run_ingest` reports watchlist sources *skipped*. The **operator path** (`ingest_file` + `store_raw` + provenance sidecars) is BUILT + tested. |
+| `ingest/` network fetch | **BUILT + tested (WS-2b)** | `FoundryFetcher.fetch` over per-source `documents = [...]` URLs; `fetch_url` HTTPS-only at every redirect hop (no override), redirect cap 5, streamed 50MB cap, PDF magic; doc_id = requested-URL slug + unconditional sha256[:8] suffix (exact URL string is identity); sidecar from watchlist fields (final post-redirect URL recorded for audit); rate-paced; quarantined doc_ids refused, never silently revived. Sources without `documents` are skipped (HTML discovery → WS-3). The **operator path** (`ingest_file`) is unchanged. |
 | `extract/` extractor | **BUILT + tested** | `AnthropicExtractor`, `validate.py` grounding, versioned prompts, offline golden (recorded `llm_response.json`) + `@live` anchor. |
 | `extract/` orchestration (`run_extract`) | **BUILT + tested (WS-1)** | sidecar → Document → extractor → `persist_extraction`; idempotent by (doc_id, file_sha256); same-doc_id/changed-bytes surfaced as a revision; per-doc fault isolation. |
 | `store/` persist + reconcile | **BUILT + in prod** | now invoked by `run_extract`; `stored_doc_shas` drives idempotency. |
@@ -88,7 +88,7 @@ from the Class A list here + in CLAUDE.md.
   injection-live-in-WS-1 framing + add a wiring injection test) and applied; per-doc
   fault isolation added. Gate outcome: **proceed**.
 
-### WS-2 — Live ingest (network fetch) + Class A trust model — **WS-2a BUILT + PRECOMMIT GATE PASSED (2026-08-18, conditions applied); WS-2b NEXT**
+### WS-2 — Live ingest (network fetch) + Class A trust model — **COMPLETE: WS-2a AND WS-2b BUILT, both precommit gates passed with conditions applied**
 
 Status: step 1 (sparsity grounding + vendor case-fold) shipped as its own PR;
 step 2 (WS-2a trust hardening) built on `feat/ws2a-trust`, verified by appsec
@@ -100,8 +100,27 @@ non-retraction hole; all adjudicated conditions applied before commit: fold
 replays `_extracted_at` chronology, forget post-condition, sidecar binding as
 consistency-not-authentication, JSON CHECKs sized to accumulated escaped worst
 case + alias_overflow at merge, shared `textnorm.fold`, honest fixtures added).
-Suite: offline 119/3, live 122/0. Step 3 (WS-2b fetcher) not started —
-next workstream, on the hardened, retractable, order-coherent store.
+Suite after WS-2a: offline 119/3, live 122/0.
+
+Step 3 (WS-2b fetcher) BUILT on `feat/ws2b-fetcher` and passed its precommit
+swarm gate (`docs/reviews/2026-08-19-fetcher-precommit/` — 3× conditional +
+devils-advocate; four conflicts human-adjudicated, all conditions applied
+before commit): **unconditional sha256[:8] doc_id suffix** (closes the
+cross-run distinct-URL/same-slug collision the in-run preflight could never
+catch — the exact operator-typed URL string is identity); **quarantine revival
+guard** in `run_ingest` (the DA's blocker all three angle reviewers missed:
+`forget` + a routine watchlist re-run silently resurrected the retracted doc;
+now refused loudly, `ingest-file` stays the explicit revival path);
+`IngestReport.errors` unified on requested-URL keys; `FetchOutcome`
+success-XOR-error enforced in `__post_init__`; `requests_per_minute` moved to
+a pydantic `Field(gt=0)`; docs de-staled. Deferred at the gate with named
+triggers: **wall-clock fetch deadline** (slow-loris; per-read timeout re-arms —
+trigger: a live run demonstrably hangs, or the watchlist grows beyond a
+handful of hosts); **SSRF-via-redirect to internal hosts** accepted as a
+residual (operator-curated watchlist; a resolved-address block would have to
+sit above the tested transport seam and break the local-server suite —
+trigger: any non-operator-supplied URL source); **incremental CLI ingest
+feedback** (trigger: a real multi-document run feels hung at 60/rpm pacing).
 
 Trust-model design gate run at `docs/reviews/2026-08-18-live-ingest-plan/`
 (3× conditional + devils-advocate challenge; four forks adjudicated by the
@@ -126,10 +145,11 @@ human — see `resolution.md`, which is authoritative). Build order:
    J advisory flag. Acceptance: named hostile suite **plus honest-corpus
    regression** (golden verdicts unchanged except approved diffs) **plus flag
    budget** (≤1 new flag per honest assessment).
-3. **WS-2b — fetcher:** direct document URLs only (HTML discovery → WS-3);
-   HTTPS-only re-validated per redirect hop, redirect/size caps, PDF magic
-   bytes, config rate limits; URL-slug doc_id (safe now that supersession
-   exists); sidecar from operator watchlist fields; local-server tests only.
+3. **WS-2b — fetcher (BUILT, gate passed 2026-08-20):** direct document URLs
+   only (HTML discovery → WS-3); HTTPS-only re-validated per redirect hop,
+   redirect/size caps, PDF magic bytes, config rate limits; URL-slug+hash
+   doc_id (safe now that supersession exists); sidecar from operator watchlist
+   fields; local-server tests only.
 
 **Deferred with named triggers** (from the gate): **H2** all-tier-3 confidence
 cap — trigger: watchlist carries ≥2 distinct tier-3 publishers for one metric;

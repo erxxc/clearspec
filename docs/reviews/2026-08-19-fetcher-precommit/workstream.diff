@@ -1,0 +1,1148 @@
+diff --git a/config.toml b/config.toml
+index c7065b0..5d9ca2c 100644
+--- a/config.toml
++++ b/config.toml
+@@ -15,26 +15,34 @@ raw_dir  = "data/raw"          # content-addressed raw docs, keyed by sha256
+ db_path  = "data/semianalyst.db"
+ 
+ [rate_limits]
+-# Applied by the ingest fetchers once network fetch lands.
++# Applied by `semianalyst ingest` (run_ingest): sequential fetching with a
++# min-interval sleep of 60/requests_per_minute seconds between requests.
+ requests_per_minute = 10
+ max_concurrency     = 2
+ 
+ # Watchlist of sources. doc_type and source_tier map to the schema enums:
+ #   source_tier: 1=conference, 2=foundry, 3=vendor
++# `url` is the source's index page (identification only this phase); `documents`
++# lists explicit document URLs to fetch — the WS-2b direct-URL scope. Discovering
++# document URLs by crawling the index page is HTML-discovery work, deferred to
++# WS-3. `publisher` (optional) names the sidecar publisher; defaults to `name`.
+ [[sources]]
+ name        = "TSMC Technology"
+ url         = "https://pr.tsmc.com/english/news"
+ doc_type    = "foundry_announcement"
+ source_tier = 2
++# documents = ["https://pr.tsmc.com/english/news/<file>.pdf"]  # explicit URLs until WS-3 discovery
+ 
+ [[sources]]
+ name        = "Samsung Foundry"
+ url         = "https://semiconductor.samsung.com/foundry/newsroom/"
+ doc_type    = "foundry_announcement"
+ source_tier = 2
++# documents = ["https://semiconductor.samsung.com/foundry/newsroom/<file>.pdf"]  # explicit URLs until WS-3 discovery
+ 
+ [[sources]]
+ name        = "Intel Foundry"
+ url         = "https://www.intel.com/content/www/us/en/newsroom/home.html"
+ doc_type    = "foundry_announcement"
+ source_tier = 2
++# documents = ["https://www.intel.com/content/dam/www/central-libraries/us/en/documents/<file>.pdf"]  # explicit URLs until WS-3 discovery
+diff --git a/src/semianalyst/cli.py b/src/semianalyst/cli.py
+index eb761a5..80e1435 100644
+--- a/src/semianalyst/cli.py
++++ b/src/semianalyst/cli.py
+@@ -74,13 +74,24 @@ def db_init() -> None:
+ 
+ @app.command()
+ def ingest() -> None:
+-    """Fetch sources from the watchlist and store raw docs content-addressed by sha256."""
++    """Fetch configured document URLs from the watchlist and store raw docs
++    content-addressed by sha256 (with provenance sidecars)."""
+     report = run_ingest(load_config())
+     if report.note:
+         typer.echo(report.note)
+-    typer.echo(f"fetched: {len(report.fetched)}  skipped: {len(report.skipped)}")
++    typer.echo(
++        f"fetched: {len(report.fetched)}  unchanged: {len(report.unchanged)}  "
++        f"skipped: {len(report.skipped)}  errors: {len(report.errors)}"
++    )
++    for doc_id in report.fetched:
++        typer.echo(f"  fetched: {_ansi_safe(doc_id)}")
++    for doc_id in report.unchanged:
++        typer.echo(f"  unchanged (identical bytes already stored): {_ansi_safe(doc_id)}")
+     for name in report.skipped:
+-        typer.echo(f"  skipped: {name}")
++        typer.echo(f"  skipped (no documents configured): {_ansi_safe(name)}")
++    for key, reason in report.errors:
++        # key/reason can embed server-influenced strings (hop URLs) — sanitize.
++        typer.echo(f"  ERROR {_ansi_safe(key)}: {_ansi_safe(reason)}")
+ 
+ 
+ @app.command("ingest-file")
+diff --git a/src/semianalyst/config.py b/src/semianalyst/config.py
+index e3f793a..e93f077 100644
+--- a/src/semianalyst/config.py
++++ b/src/semianalyst/config.py
+@@ -54,6 +54,12 @@ class Source(BaseModel):
+     url: str
+     doc_type: str
+     source_tier: int
++    # Sidecar publisher; ingest falls back to `name` when omitted (WS-2b).
++    publisher: str | None = None
++    # Explicit document URLs to fetch — the WS-2b direct-URL scope. Discovering
++    # documents from the index page at `url` is HTML-discovery work (WS-3).
++    # Defaults keep parsing backward-compatible with pre-WS-2b config files.
++    documents: tuple[str, ...] = ()
+ 
+ 
+ class Config(BaseModel):
+diff --git a/src/semianalyst/ingest/__init__.py b/src/semianalyst/ingest/__init__.py
+index 0585227..c1b1bcc 100644
+--- a/src/semianalyst/ingest/__init__.py
++++ b/src/semianalyst/ingest/__init__.py
+@@ -4,6 +4,7 @@ from .base import (
+     EXTRACTION_SUFFIX,
+     SIDECAR_SUFFIX,
+     ExtractionArtifact,
++    FetchOutcome,
+     Fetcher,
+     RawDoc,
+     RawRef,
+@@ -17,13 +18,22 @@ from .base import (
+     write_extraction_artifact,
+     write_sidecar,
+ )
++from .fetch import FetchedDoc, FetchError, fetch_url, looks_like_pdf
+ from .foundry import FoundryFetcher
+-from .pipeline import ForgetReport, IngestReport, forget, ingest_file, run_ingest
++from .pipeline import (
++    ForgetReport,
++    IngestReport,
++    forget,
++    ingest_file,
++    run_ingest,
++    url_doc_id,
++)
+ 
+ __all__ = [
+     "EXTRACTION_SUFFIX",
+     "SIDECAR_SUFFIX",
+     "ExtractionArtifact",
++    "FetchOutcome",
+     "Fetcher",
+     "RawDoc",
+     "RawRef",
+@@ -36,10 +46,15 @@ __all__ = [
+     "store_raw",
+     "write_extraction_artifact",
+     "write_sidecar",
++    "FetchedDoc",
++    "FetchError",
++    "fetch_url",
++    "looks_like_pdf",
+     "FoundryFetcher",
+     "ForgetReport",
+     "IngestReport",
+     "forget",
+     "ingest_file",
+     "run_ingest",
++    "url_doc_id",
+ ]
+diff --git a/src/semianalyst/ingest/base.py b/src/semianalyst/ingest/base.py
+index 74cd511..22bd405 100644
+--- a/src/semianalyst/ingest/base.py
++++ b/src/semianalyst/ingest/base.py
+@@ -14,7 +14,7 @@ import hashlib
+ import json
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Iterable, Protocol
++from typing import Callable, Protocol
+ 
+ # A raw blob is stored at raw_dir/<sha256> (no suffix). Its provenance sidecar —
+ # the metadata needed to build a Document at extract time — lives beside it at
+@@ -46,6 +46,8 @@ class SourceRef:
+     url: str
+     doc_type: str
+     source_tier: int
++    publisher: str | None = None     # sidecar publisher; run_ingest falls back to `name`
++    documents: tuple[str, ...] = ()  # explicit document URLs (WS-2b direct-URL scope; HTML discovery is WS-3)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -57,6 +59,21 @@ class RawRef:
+     is_new: bool  # False when the identical bytes were already stored (idempotent no-op)
+ 
+ 
++@dataclass(frozen=True)
++class FetchOutcome:
++    """One configured document URL's fetch result — success XOR error, never
++    both. `requested_url` is the operator-typed identity from config;
++    `final_url` is the post-redirect URL (audit trail; None when the transport
++    never completed); `raw` is set only on success, `error` is a fixed-text
++    reason on failure (per-document fault isolation — one bad URL never aborts
++    a source's batch)."""
++
++    requested_url: str
++    final_url: str | None = None
++    raw: RawRef | None = None
++    error: str | None = None
++
++
+ @dataclass(frozen=True)
+ class RawDoc:
+     """A stored raw blob paired with the provenance metadata that lets extract
+@@ -213,12 +230,20 @@ def read_extraction_artifacts(raw_dir: Path) -> tuple[list[ExtractionArtifact],
+ 
+ 
+ class Fetcher(Protocol):
+-    """A source-specific fetcher.
+-
+-    Implementations turn a SourceRef into raw bytes (HTTP, file, etc.) and use
+-    `store_raw` to persist them idempotently. Network fetch is not implemented
+-    this phase — see foundry.py.
++    """A source-specific fetcher (WS-2b shape: per-document outcomes).
++
++    Implementations fetch each URL in `source.documents` and pass accepted
++    bytes through `store_raw`, so re-fetching unchanged bytes is a no-op and
++    changed bytes at the same URL become a new blob (revision detection
++    downstream in run_extract). Each document is fault-isolated: a failure is
++    an outcome carrying `error`, never an exception that sinks the source.
++    `pace` MUST be called before every network request — run_ingest supplies
++    it to enforce the configured rate limit across the whole run. Sidecar
++    identity (doc_id, provenance) is NOT the fetcher's job; run_ingest derives
++    it from each outcome's requested/final URLs.
+     """
+ 
+-    def fetch(self, source: SourceRef) -> Iterable[RawRef]:
++    def fetch(
++        self, source: SourceRef, raw_dir: Path, *, pace: Callable[[], None]
++    ) -> list[FetchOutcome]:
+         ...
+diff --git a/src/semianalyst/ingest/fetch.py b/src/semianalyst/ingest/fetch.py
+new file mode 100644
+index 0000000..945e9d3
+--- /dev/null
++++ b/src/semianalyst/ingest/fetch.py
+@@ -0,0 +1,191 @@
++"""HTTPS document fetch — the WS-2b transport core (gate: plan §1, resolution
++"Outcome" item 3). Stdlib urllib only; no new dependencies.
++
++Design: POLICY and TRANSPORT are separate layers, and that separation is the
++test seam. `_fetch` is the policy engine — it validates the scheme of EVERY
++URL (the initial one and every redirect hop) BEFORE any bytes move, runs the
++manual redirect loop, and enforces the streamed size cap. `_transport` is the
++byte-mover: one request, redirects disabled, socket timeout set — mechanically
++scheme-agnostic, because the HTTPS-ONLY guarantee deliberately does not live
++there. The PUBLIC `fetch_url` binds the policy engine to the real transport
++and takes no override: it can never be talked into a non-https request, not
++even by a test. Tests inject a transport that rewrites https->http strictly
++BELOW the policy boundary and serve from a local plaintext http.server, so the
++real scheme checks / redirect loop / caps are what run under test (a local
++server cannot present certificates, and an `_allow_insecure` flag on the
++public surface would be a production backdoor dressed as a fixture).
++"""
++
++from __future__ import annotations
++
++import urllib.error
++import urllib.request
++from dataclasses import dataclass
++from typing import Callable
++from urllib.parse import urljoin, urlsplit
++
++_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
++_CHUNK = 65536
++# Hop URLs come from server-controlled Location headers; when one must appear
++# in an error message (the spec: refusals NAME the hop) it is length-bounded
++# here, and every display of it goes through cli._ansi_safe like all
++# adversary-influenced strings.
++_URL_IN_ERR = 200
++
++
++class FetchError(Exception):
++    """A fetch refused or failed. Messages are FIXED TEXT plus a bounded URL
++    and, for transport failures, an exception TYPE name — never response-body
++    bytes and never server-authored prose (the `_err_repr` precedent:
++    server-controlled text does not enter error strings)."""
++
++
++@dataclass(frozen=True)
++class FetchedDoc:
++    content: bytes
++    final_url: str  # post-redirect URL — recorded in the sidecar for audit
++
++
++class _NoRedirect(urllib.request.HTTPRedirectHandler):
++    """Disable urllib's automatic redirect following: returning None makes
++    every 3xx surface as an HTTPError for `_fetch` to inspect. The redirect
++    loop is manual so the https-only policy runs at EVERY hop — urllib's
++    built-in follower would happily walk a compromised site's bounce to
++    http:// before we ever saw the Location."""
++
++    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
++        return None
++
++
++_OPENER = urllib.request.build_opener(_NoRedirect())
++
++
++def _transport(url: str, timeout: float):
++    """One request, redirects disabled, socket timeout applied. See the module
++    docstring: scheme enforcement lives in `_fetch`, one layer up — this is
++    the injectable byte-mover under it."""
++    return _OPENER.open(url, timeout=timeout)
++
++
++def _trunc(url: str) -> str:
++    return url if len(url) <= _URL_IN_ERR else url[:_URL_IN_ERR] + "..."
++
++
++def _require_https(url: str, *, hop: int) -> None:
++    """The per-hop scheme gate, run BEFORE the URL reaches any transport. A
++    compromised or MITM'd site must not bounce us to http:// (plaintext),
++    file:// (local read), or ftp:// — the refusal names the hop so the
++    operator can see WHERE a chain went bad."""
++    try:
++        parts = urlsplit(url)
++    except ValueError:
++        raise FetchError(f"unparseable URL at hop {hop}: {_trunc(url)}") from None
++    if parts.scheme.lower() != "https" or not parts.netloc:
++        where = "before any request" if hop == 0 else f"at redirect hop {hop}"
++        raise FetchError(
++            f"refused non-https URL {where} "
++            f"(scheme {parts.scheme.lower() or 'none'!r}): {_trunc(url)}"
++        )
++
++
++def looks_like_pdf(content: bytes) -> bool:
++    """Magic-byte check, deliberately separate from transport: a fetched-but-
++    not-PDF document is a distinct, precisely-nameable per-document refusal,
++    not a transport failure — callers (FoundryFetcher) report it as such."""
++    return content.startswith(b"%PDF-")
++
++
++def _read_capped(resp, max_bytes: int, url: str) -> bytes:
++    """Streamed read under the byte cap: abort the moment the cap is exceeded,
++    never buffer unbounded. Content-Length is a COURTESY fast-abort only — it
++    may lie or be absent, so the streamed count is the enforcement."""
++    declared = resp.headers.get("Content-Length") if resp.headers else None
++    if declared is not None:
++        try:
++            declared_n = int(declared)
++        except ValueError:
++            declared_n = None  # a garbage header is not a verdict either way
++        if declared_n is not None and declared_n > max_bytes:
++            raise FetchError(
++                f"size cap exceeded (declared Content-Length > {max_bytes} bytes): {_trunc(url)}"
++            )
++    chunks: list[bytes] = []
++    total = 0
++    while True:
++        try:
++            chunk = resp.read(_CHUNK)
++        except (TimeoutError, OSError) as exc:
++            raise FetchError(f"read failed ({type(exc).__name__}): {_trunc(url)}") from exc
++        if not chunk:
++            return b"".join(chunks)
++        total += len(chunk)
++        if total > max_bytes:
++            raise FetchError(f"size cap exceeded (> {max_bytes} bytes streamed): {_trunc(url)}")
++        chunks.append(chunk)
++
++
++def fetch_url(
++    url: str,
++    *,
++    max_bytes: int = 50_000_000,
++    max_redirects: int = 5,
++    timeout: float = 30.0,
++) -> FetchedDoc:
++    """Fetch one document over HTTPS — the ONLY public fetch surface.
++
++    HTTPS-only at the initial URL and at every redirect hop; manual redirect
++    loop capped at `max_redirects`; streamed read capped at `max_bytes`;
++    socket timeout on every request. Permanently bound to the real transport —
++    no scheme override, no insecure mode (the test seam is `_fetch`'s
++    transport parameter, below the policy boundary; see the module docstring).
++    """
++    return _fetch(
++        url, max_bytes=max_bytes, max_redirects=max_redirects, timeout=timeout,
++        transport=_transport,
++    )
++
++
++def _fetch(
++    url: str,
++    *,
++    max_bytes: int,
++    max_redirects: int,
++    timeout: float,
++    transport: Callable[[str, float], object],
++) -> FetchedDoc:
++    """The policy engine (see module docstring). `transport` moves bytes for
++    ONE already-validated URL; everything security-relevant — per-hop scheme
++    checks, the redirect walk, both caps — happens here, identically for the
++    real transport and a test's."""
++    current = url
++    # hop 0 is the initial request; hops 1..max_redirects are followed
++    # redirects. A redirect off the last permitted request exits the loop.
++    for hop in range(max_redirects + 1):
++        _require_https(current, hop=hop)
++        try:
++            resp = transport(current, timeout)
++        except urllib.error.HTTPError as err:  # subclasses URLError — catch first
++            if err.code in _REDIRECT_CODES:
++                location = err.headers.get("Location")
++                code = err.code
++                err.close()
++                if not location:
++                    raise FetchError(
++                        f"redirect (HTTP {code}) without a Location header: {_trunc(current)}"
++                    ) from None
++                # Relative Locations resolve against the CURRENT hop's URL
++                # (RFC 9110 §10.2.2); the resolved URL is re-validated at the
++                # top of the next iteration before any request is made.
++                current = urljoin(current, location)
++                continue
++            code = err.code
++            err.close()
++            raise FetchError(f"http error status {code}: {_trunc(current)}") from None
++        except urllib.error.URLError as exc:
++            reason = type(exc.reason).__name__ if exc.reason is not None else type(exc).__name__
++            raise FetchError(f"connection failed ({reason}): {_trunc(current)}") from exc
++        except (TimeoutError, OSError) as exc:
++            raise FetchError(f"connection failed ({type(exc).__name__}): {_trunc(current)}") from exc
++        with resp:
++            return FetchedDoc(content=_read_capped(resp, max_bytes, current), final_url=current)
++    raise FetchError(f"too many redirects (> {max_redirects}): {_trunc(current)}")
+diff --git a/src/semianalyst/ingest/foundry.py b/src/semianalyst/ingest/foundry.py
+index 1140bf0..9eabc0c 100644
+--- a/src/semianalyst/ingest/foundry.py
++++ b/src/semianalyst/ingest/foundry.py
+@@ -1,27 +1,70 @@
+-"""Foundry announcement fetcher — TSMC / Samsung / Intel newsroom pages.
+-
+-STUB (this phase): the network fetch, HTML/PDF discovery, and rate limiting are
+-not implemented yet. The idempotent raw-storage path (base.store_raw) is real
+-and exercised by tests. When network fetch lands here it must:
+-  - honour config.rate_limits (requests_per_minute, max_concurrency),
+-  - validate the URL scheme (https only) before fetching — sources come from
+-    the operator's config watchlist, but treat fetched content as untrusted,
+-  - pass fetched bytes through store_raw so re-fetching an unchanged page is a
+-    no-op and a changed page produces a new sha256 (silent-revision detection).
++"""Foundry direct-document fetcher — TSMC / Samsung / Intel watchlist sources.
++
++WS-2b scope (gate: docs/reviews/2026-08-18-live-ingest-plan/, plan §1 +
++resolution "Outcome" item 3): the operator names each document URL explicitly
++in config.toml (`documents = [...]`); crawling newsroom index pages to
++DISCOVER documents is scraping fragility that adds zero trust-model coverage
++and is deferred to WS-3. Every fetched byte is untrusted — semi-adversarial
++vendor marketing is the tool's whole subject — so this module refuses non-PDF
++bytes by magic before storing anything, and the transport underneath
++(fetch.fetch_url) is https-only at every redirect hop with size/redirect caps.
+ """
+ 
+ from __future__ import annotations
+ 
+-from typing import Iterable
++from pathlib import Path
++from typing import Callable
++
++from .base import FetchOutcome, SourceRef, store_raw
++from .fetch import FetchedDoc, FetchError, fetch_url, looks_like_pdf
++
+ 
+-from .base import Fetcher, RawRef, SourceRef
++class FoundryFetcher:
++    """Fetch each explicitly-configured document URL for a source; refuse
++    non-PDF magic; store accepted bytes content-addressed.
+ 
++    `fetch_fn` is the injection seam for tests: it defaults to the real,
++    permanently-https-only `fetch_url`, and tests bind fetch._fetch to a
++    transport that serves from a local plaintext server BELOW the policy
++    boundary (see fetch.py's module docstring) — the policy code under test is
++    identical either way. Per-document fault isolation lives here (a
++    FetchError or a magic refusal becomes an error OUTCOME; the source's
++    remaining documents still fetch); doc_id derivation, sidecars, and
++    reporting live in pipeline.run_ingest.
++    """
+ 
+-class FoundryFetcher(Fetcher):
+-    """Fetches foundry announcement pages. Not yet implemented."""
++    def __init__(self, fetch_fn: Callable[[str], FetchedDoc] = fetch_url) -> None:
++        self._fetch = fetch_fn
+ 
+-    def fetch(self, source: SourceRef) -> Iterable[RawRef]:
+-        raise NotImplementedError(
+-            "Foundry network fetch is not implemented yet (structure-only phase). "
+-            "Idempotent raw storage is available via ingest.base.store_raw."
+-        )
++    def fetch(
++        self, source: SourceRef, raw_dir: Path, *, pace: Callable[[], None]
++    ) -> list[FetchOutcome]:
++        outcomes: list[FetchOutcome] = []
++        for url in source.documents:
++            # Rate pacing before every document request (run_ingest owns the
++            # interval). Redirect hops WITHIN one fetch_url call are not
++            # separately paced — they are one logical fetch, bounded by
++            # max_redirects.
++            pace()
++            try:
++                fetched = self._fetch(url)
++            except FetchError as exc:
++                outcomes.append(FetchOutcome(requested_url=url, error=str(exc)))
++                continue
++            if not looks_like_pdf(fetched.content):
++                # Refused BEFORE store_raw: bytes we will not treat as a
++                # document never land content-addressed in data/raw/. Fixed
++                # text only — served bytes never enter the reason.
++                outcomes.append(
++                    FetchOutcome(
++                        requested_url=url,
++                        final_url=fetched.final_url,
++                        error="not a PDF (magic bytes %PDF- missing)",
++                    )
++                )
++                continue
++            raw = store_raw(fetched.content, raw_dir)
++            outcomes.append(
++                FetchOutcome(requested_url=url, final_url=fetched.final_url, raw=raw)
++            )
++        return outcomes
+diff --git a/src/semianalyst/ingest/pipeline.py b/src/semianalyst/ingest/pipeline.py
+index 6e31491..695f93f 100644
+--- a/src/semianalyst/ingest/pipeline.py
++++ b/src/semianalyst/ingest/pipeline.py
+@@ -1,15 +1,17 @@
+ """Ingest orchestration — the library entry points behind `semianalyst ingest`
+ and `semianalyst ingest-file`.
+ 
+-`run_ingest` iterates the config watchlist and drives the per-source fetchers.
+-Network fetch is stubbed this phase (WS-2), so watchlist sources are reported as
+-skipped rather than fetched.
++`run_ingest` (WS-2b, live) iterates the config watchlist and drives the
++per-source fetchers over each source's explicitly-configured document URLs:
++fetch (https-only, capped), magic-check, store content-addressed, write the
++provenance sidecar — the same sidecar shape `ingest_file` writes, so extract
++stays fetch-source-agnostic (CLAUDE.md, sidecar-handoff). Sources without a
++`documents` list are skipped: HTML discovery of documents from index pages is
++WS-3.
+ 
+-`ingest_file` is the operator path that works TODAY, with zero network: it stores
+-a local file content-addressed and writes its provenance sidecar, so `extract`
+-can pick it up. This keeps the curated-fixture trust boundary — an operator
+-hand-feeds a document; no hostile document reaches the store. Both the CLI and a
+-future web UI call these.
++`ingest_file` is the operator path: it stores a local file content-addressed
++and writes its provenance sidecar, so `extract` can pick it up. Both the CLI
++and a future web UI call these.
+ 
+ `forget` is the retraction primitive (WS-2a gate, Challenge 1): quarantine a
+ doc_id's sidecars + extraction artifacts, then refold the store so no trace of
+@@ -19,14 +21,28 @@ the document remains in derived state.
+ from __future__ import annotations
+ 
+ import datetime as dt
++import hashlib
+ import json
++import re
+ import shutil
++import time
+ from dataclasses import dataclass, field
+-from pathlib import Path
+-from typing import TYPE_CHECKING
++from pathlib import Path, PurePosixPath
++from typing import TYPE_CHECKING, Callable
++from urllib.parse import urlsplit
+ 
+ from ..config import Config, load_config
+-from .base import SIDECAR_SUFFIX, RawDoc, extraction_artifact_path, store_raw, write_sidecar
++from .base import (
++    SIDECAR_SUFFIX,
++    Fetcher,
++    RawDoc,
++    SidecarCollision,
++    SourceRef,
++    extraction_artifact_path,
++    store_raw,
++    write_sidecar,
++)
++from .foundry import FoundryFetcher
+ 
+ if TYPE_CHECKING:  # runtime import lives inside forget() — see the comment there
+     from ..extract.pipeline import RebuildReport
+@@ -38,8 +54,10 @@ QUARANTINE_DIRNAME = "quarantine"
+ 
+ @dataclass
+ class IngestReport:
+-    fetched: list[str] = field(default_factory=list)
+-    skipped: list[str] = field(default_factory=list)
++    fetched: list[str] = field(default_factory=list)    # doc_ids whose bytes are NEW in data/raw/ (first fetch OR a revision)
++    unchanged: list[str] = field(default_factory=list)  # identical bytes re-fetched — the honest no-op, distinct from fetched
++    skipped: list[str] = field(default_factory=list)    # sources with no documents configured (HTML discovery: WS-3)
++    errors: list[tuple[str, str]] = field(default_factory=list)  # (requested_url|doc_id, fixed reason) — per-doc isolation
+     note: str = ""
+ 
+ 
+@@ -50,15 +68,138 @@ class ForgetReport:
+     rebuild: RebuildReport | None = None
+ 
+ 
+-def run_ingest(config: Config | None = None) -> IngestReport:
++# doc_id slug geometry: 111 + 1 ('_') + 8 (hash) = 120, DocId120's max length.
++_SLUG_MAX = 111
++_SLUG_HASH_LEN = 8
++
++
++def url_doc_id(url: str) -> str:
++    """Deterministic doc_id for a fetched document: host+path of the REQUESTED
++    URL, lowercased, runs of non-[a-z0-9] collapsed to '_', stripped; when that
++    exceeds 111 chars it is truncated and suffixed with '_' + sha256(url)[:8]
++    so two long URLs sharing a prefix stay distinct (120 chars total — exactly
++    DocId120's bound, whose charset permits '_').
++
++    Identity is the OPERATOR-TYPED (requested) URL, never the post-redirect
++    final one: the redirect target is server-controlled and can change per
++    fetch, so keying identity on it would let a hostile or flaky server mint a
++    fresh doc_id on every fetch (each revision arrives as a "new" document,
++    defeating same-doc_id supersession) or steer two watchlist entries onto
++    one doc_id. URL = identity, content = version (plan §1); the final URL is
++    still recorded in the sidecar for audit. Distinct short URLs that slug
++    identically are an accepted residual surfaced by analyze's
++    `possible_slug_collision` advisory (J), never silently merged bytes —
++    each revision is its own blob + sidecar.
++    """
++    parts = urlsplit(url)
++    slug = re.sub(r"[^a-z0-9]+", "_", f"{parts.netloc}{parts.path}".lower()).strip("_")
++    if len(slug) > _SLUG_MAX:
++        digest = hashlib.sha256(url.encode()).hexdigest()[:_SLUG_HASH_LEN]
++        slug = f"{slug[:_SLUG_MAX]}_{digest}"
++    # A URL with an empty host+path slug can't happen for a fetchable https URL
++    # (the fetcher requires a netloc), but fail toward a valid, deterministic
++    # id rather than an empty string DocId120 would reject.
++    return slug or f"doc_{hashlib.sha256(url.encode()).hexdigest()[:16]}"
++
++
++def _url_title(url: str) -> str:
++    """Display title from the requested URL's path basename — display data,
++    not identity — bounded to Document.title's 300 chars. The requested URL is
++    operator-typed config, so no charset scrub is needed here; pydantic still
++    fail-louds on control bytes at extract time."""
++    name = PurePosixPath(urlsplit(url).path).name
++    return (name or url_doc_id(url))[:300]
++
++
++def run_ingest(
++    config: Config | None = None,
++    *,
++    fetcher: Fetcher | None = None,
++    sleeper: Callable[[float], None] = time.sleep,
++) -> IngestReport:
++    """Fetch every explicitly-configured document URL on the watchlist and
++    write the same provenance sidecar shape `ingest_file` writes.
++
++    Rate pacing: fetching is SEQUENTIAL with a min-interval sleep of
++    60/requests_per_minute seconds between consecutive requests, shared across
++    all sources in the run. Sequential execution honors any max_concurrency
++    >= 1 (a single in-flight request never exceeds a concurrency budget).
++    `sleeper` is injectable so tests record the pacing instead of sleeping.
++
++    Fault isolation mirrors ExtractReport: a FetchError, a non-PDF magic
++    refusal, or a SidecarCollision lands in `errors` and the batch continues.
++
++    A changed-bytes re-fetch of a known URL needs NO special handling here:
++    store_raw content-addresses the new bytes as a new blob, the sidecar binds
++    the same doc_id (same requested URL) to the new sha, and run_extract's
++    revision path (extract + refold supersession) does the rest.
++    """
+     config = config or load_config()
+-    report = IngestReport(
+-        note="network fetch not implemented yet (WS-2); ingest a local file with "
+-        "ingest.ingest_file / `semianalyst ingest-file`."
+-    )
++    fetcher = fetcher or FoundryFetcher()
++    report = IngestReport()
++
++    rpm = config.rate_limits.requests_per_minute
++    if rpm <= 0:
++        # Fail loud, never reinterpret: rounding 0 up to some rate would fetch
++        # FASTER than the operator configured — the wrong fail direction.
++        raise ValueError("rate_limits.requests_per_minute must be positive to fetch")
++    interval = 60.0 / rpm
++    requested_before = False  # no sleep before the run's very first request
++
++    def pace() -> None:
++        nonlocal requested_before
++        if requested_before:
++            sleeper(interval)
++        requested_before = True
++
++    today = dt.date.today().isoformat()
+     for source in config.sources:
+-        # A real fetcher would run here and append new sha256s to report.fetched.
+-        report.skipped.append(source.name)
++        if not source.documents:
++            # Direct-URL scope (gate, plan §1): a source carrying only an
++            # index-page url has nothing fetchable until WS-3's HTML discovery.
++            report.skipped.append(source.name)
++            continue
++        ref = SourceRef(
++            name=source.name, url=source.url, doc_type=source.doc_type,
++            source_tier=source.source_tier, publisher=source.publisher,
++            documents=source.documents,
++        )
++        for outcome in fetcher.fetch(ref, config.paths.raw_dir, pace=pace):
++            if outcome.error is not None or outcome.raw is None:
++                report.errors.append(
++                    (outcome.requested_url, outcome.error or "fetcher returned no blob")
++                )
++                continue
++            doc_id = url_doc_id(outcome.requested_url)
++            meta = {
++                "doc_id": doc_id,
++                "title": _url_title(outcome.requested_url),
++                # doc_type/source_tier/publisher are operator-trusted config;
++                # publisher falls back to the source's display name.
++                "publisher": source.publisher or source.name,
++                "doc_type": source.doc_type,
++                "source_tier": source.source_tier,
++                # The FINAL post-redirect URL, recorded for audit; identity
++                # stays keyed on the requested URL (url_doc_id above).
++                "url": outcome.final_url,
++                "publish_date": None,  # unknown — never guessed from untrusted headers
++                "ingest_date": today,
++                "file_sha256": outcome.raw.sha256,
++            }
++            try:
++                write_sidecar(config.paths.raw_dir, outcome.raw.sha256, meta)
++            except SidecarCollision as exc:
++                # S1: these bytes are already bound to another doc_id — the
++                # first ingest's provenance wins; this URL's claim is refused.
++                report.errors.append((doc_id, str(exc)))
++                continue
++            (report.fetched if outcome.raw.is_new else report.unchanged).append(doc_id)
++
++    if report.skipped:
++        report.note = (
++            "skipped source(s) have no `documents = [...]` URLs configured — "
++            "direct document URLs only this phase; HTML discovery is WS-3."
++        )
+     return report
+ 
+ 
+diff --git a/tests/test_fetch.py b/tests/test_fetch.py
+new file mode 100644
+index 0000000..77a584f
+--- /dev/null
++++ b/tests/test_fetch.py
+@@ -0,0 +1,418 @@
++"""WS-2b fetcher: transport policy, run_ingest wiring, and the ingest->extract
++E2E over a LOCAL http.server — zero real network, zero API key.
++
++The test seam (fetch.py module docstring): the PUBLIC fetch_url is permanently
++https-only with no override, so https refusals are tested directly against it
++with no server at all. Transport behaviors (redirect walking, caps, magic
++bytes) are tested through the internal policy engine `fetch._fetch` with an
++injected transport that rewrites https->http strictly BELOW the policy
++boundary — the scheme checks, redirect loop, and caps under test are the real
++production code paths; only the byte-mover differs (a local plaintext server
++cannot present certificates, and a public insecure flag would be a backdoor).
++"""
++
++from __future__ import annotations
++
++import datetime as dt
++import hashlib
++import json
++import re
++import threading
++from dataclasses import dataclass, field
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++import pytest
++
++from semianalyst import store
++from semianalyst.analyze import run_analysis
++from semianalyst.config import Config, ModelConfig, PathsConfig, RateLimits, Source
++from semianalyst.extract import AnthropicExtractor, ReplayModelClient, run_extract
++from semianalyst.ingest import (
++    SIDECAR_SUFFIX,
++    FetchError,
++    FoundryFetcher,
++    fetch_url,
++    looks_like_pdf,
++    run_ingest,
++    url_doc_id,
++)
++from semianalyst.ingest import fetch as fetchmod
++
++FIXTURES_DIR = Path(__file__).parent / "fixtures"
++CASE_DIR = FIXTURES_DIR / "tsmc_n2_2025"
++
++PDF = b"%PDF-1.4 fetched test document\n"
++DOC_ID_120 = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")  # store.models.DocId120
++
++
++# --------------------------------------------------------------------------
++# Local server + the transport seam
++# --------------------------------------------------------------------------
++@dataclass
++class _Served:
++    status: int = 200
++    body: bytes = b""
++    headers: dict = field(default_factory=dict)
++    content_length: bool = True  # False = close-delimited body (header absent)
++
++
++class _Handler(BaseHTTPRequestHandler):
++    # protocol_version stays HTTP/1.0 (the BaseHTTPRequestHandler default) so a
++    # route with content_length=False is honestly close-delimited.
++    def do_GET(self):  # noqa: N802 (http.server API)
++        self.server.hits.append(self.path)
++        route = self.server.routes.get(self.path)
++        if route is None:
++            self.send_response(404)
++            self.send_header("Content-Length", "0")
++            self.end_headers()
++            return
++        self.send_response(route.status)
++        for key, value in route.headers.items():
++            self.send_header(key, value)
++        if route.content_length and "Content-Length" not in route.headers:
++            self.send_header("Content-Length", str(len(route.body)))
++        self.end_headers()
++        self.wfile.write(route.body)
++
++    def log_message(self, *args):  # keep pytest output clean
++        pass
++
++
++@pytest.fixture
++def server():
++    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
++    httpd.routes = {}
++    httpd.hits = []
++    # small poll_interval: shutdown() blocks up to one poll, and every test owns a server
++    threading.Thread(target=lambda: httpd.serve_forever(poll_interval=0.02), daemon=True).start()
++    try:
++        yield httpd
++    finally:
++        httpd.shutdown()
++        httpd.server_close()
++
++
++def _https(server, path: str) -> str:
++    """Tests speak https to the policy layer; _local_transport moves the bytes
++    over local plaintext underneath it."""
++    return f"https://127.0.0.1:{server.server_address[1]}{path}"
++
++
++def _local_transport(url: str, timeout: float):
++    """The seam: the policy engine already approved `url` as https; rewrite the
++    scheme below the policy boundary and reuse the REAL transport (no-redirect
++    opener, socket timeout) against the local server."""
++    assert url.startswith("https://")  # the policy layer never hands us anything else
++    return fetchmod._transport("http://" + url[len("https://"):], timeout)
++
++
++def _fetch_local(url: str, *, max_bytes: int = 50_000_000, max_redirects: int = 5,
++                 timeout: float = 5.0):
++    return fetchmod._fetch(url, max_bytes=max_bytes, max_redirects=max_redirects,
++                           timeout=timeout, transport=_local_transport)
++
++
++def _no_sleep(_seconds: float) -> None:
++    pass
++
++
++def _cfg(tmp_path: Path, *sources: Source, rpm: int = 10) -> Config:
++    """tmp_config's pattern (tests/test_rebuild.py) plus a live watchlist."""
++    return Config(
++        model=ModelConfig(name="test-model", prompt_version="extract_foundry_v1"),
++        paths=PathsConfig(data_dir=tmp_path, raw_dir=tmp_path / "raw",
++                          db_path=tmp_path / "semianalyst.db"),
++        rate_limits=RateLimits(requests_per_minute=rpm, max_concurrency=1),
++        sources=tuple(sources),
++    )
++
++
++def _source(name: str, *documents: str, publisher: str | None = None) -> Source:
++    return Source(name=name, url="https://example.test/index", publisher=publisher,
++                  doc_type="foundry_announcement", source_tier=2, documents=documents)
++
++
++def _run(config: Config, sleeper=_no_sleep):
++    return run_ingest(config, fetcher=FoundryFetcher(fetch_fn=_fetch_local), sleeper=sleeper)
++
++
++def _sidecar(config: Config, sha256: str) -> dict:
++    return json.loads((config.paths.raw_dir / f"{sha256}{SIDECAR_SUFFIX}").read_text())
++
++
++# --------------------------------------------------------------------------
++# Scheme policy — PUBLIC surface, no server, no transport injection
++# --------------------------------------------------------------------------
++@pytest.mark.parametrize("url", [
++    "http://example.test/doc.pdf",
++    "ftp://example.test/doc.pdf",
++    "file:///etc/passwd",
++])
++def test_https_scheme_required(url):
++    with pytest.raises(FetchError, match="non-https URL before any request"):
++        fetch_url(url)
++
++
++def test_redirect_to_http_refused_mid_chain(server):
++    """A compromised/MITM'd site bouncing us off https is refused AT THE HOP —
++    the downgraded target is never requested."""
++    port = server.server_address[1]
++    server.routes["/bounce"] = _Served(
++        status=302, headers={"Location": f"http://127.0.0.1:{port}/loot.pdf"})
++    server.routes["/loot.pdf"] = _Served(body=PDF)
++    with pytest.raises(FetchError, match="non-https URL at redirect hop 1"):
++        _fetch_local(_https(server, "/bounce"))
++    assert server.hits == ["/bounce"]  # the http:// target was never touched
++
++
++def test_redirect_cap_enforced(server):
++    server.routes["/loop"] = _Served(status=302, headers={"Location": "/loop"})
++    with pytest.raises(FetchError, match="too many redirects"):
++        _fetch_local(_https(server, "/loop"), max_redirects=5)
++    assert server.hits == ["/loop"] * 6  # initial request + 5 followed redirects
++
++
++def test_relative_redirect_resolved(server):
++    """A relative Location resolves against the CURRENT hop's URL — and the
++    post-redirect final_url is reported for the sidecar audit trail."""
++    server.routes["/a/rel"] = _Served(status=302, headers={"Location": "b.pdf"})
++    server.routes["/a/b.pdf"] = _Served(body=PDF)
++    doc = _fetch_local(_https(server, "/a/rel"))
++    assert doc.content == PDF
++    assert doc.final_url == _https(server, "/a/b.pdf")
++
++
++# --------------------------------------------------------------------------
++# Size cap — streamed enforcement; Content-Length absent or lying
++# --------------------------------------------------------------------------
++def test_size_cap_aborts_streaming(server):
++    """No Content-Length at all (close-delimited body): the streamed count is
++    the enforcement, not the header."""
++    server.routes["/big.pdf"] = _Served(body=PDF + b"x" * 5000, content_length=False)
++    with pytest.raises(FetchError, match="size cap exceeded .* streamed"):
++        _fetch_local(_https(server, "/big.pdf"), max_bytes=1000)
++
++
++def test_size_cap_on_declared_content_length(server):
++    """A header DECLARING an oversize body aborts before the read — the
++    courtesy fast path of the same cap."""
++    server.routes["/huge.pdf"] = _Served(body=PDF, headers={"Content-Length": "99999999"})
++    with pytest.raises(FetchError, match="declared Content-Length"):
++        _fetch_local(_https(server, "/huge.pdf"), max_bytes=1000)
++
++
++def test_looks_like_pdf():
++    assert looks_like_pdf(b"%PDF-1.7 ...")
++    assert not looks_like_pdf(b"<html>not a pdf</html>")
++    assert not looks_like_pdf(b"")
++
++
++# --------------------------------------------------------------------------
++# doc_id slug — deterministic identity from the REQUESTED URL
++# --------------------------------------------------------------------------
++def test_url_doc_id_slug():
++    assert (url_doc_id("https://PR.TSMC.com/English/News/N2-Update.pdf")
++            == "pr_tsmc_com_english_news_n2_update_pdf")
++    # runs of non-[a-z0-9] collapse to one '_'; leading/trailing stripped
++    assert url_doc_id("https://a.com//x..y/") == "a_com_x_y"
++    # host+path only: the query is not identity (distinct-URL conflation is the
++    # accepted residual behind analyze's possible_slug_collision advisory, J)
++    assert url_doc_id("https://a.com/x.pdf?v=2") == url_doc_id("https://a.com/x.pdf")
++
++
++def test_url_doc_id_truncation_hash():
++    long_a = "https://example.com/reports/" + "a" * 150 + "/final.pdf"
++    long_b = "https://example.com/reports/" + "a" * 150 + "/draft.pdf"
++    doc_a, doc_b = url_doc_id(long_a), url_doc_id(long_b)
++    for url, doc_id in ((long_a, doc_a), (long_b, doc_b)):
++        assert len(doc_id) == 120 and DOC_ID_120.fullmatch(doc_id)
++        assert doc_id.endswith("_" + hashlib.sha256(url.encode()).hexdigest()[:8])
++    # the two URLs share their first 111 slug chars — only the hash separates them
++    assert doc_a[:112] == doc_b[:112] and doc_a != doc_b
++
++
++# --------------------------------------------------------------------------
++# run_ingest — report shape, isolation, idempotency, pacing, sidecars
++# --------------------------------------------------------------------------
++def test_run_ingest_skips_sources_without_documents(tmp_path):
++    """The unchanged stock config shape (no documents lists) stays valid: every
++    source is skipped, nothing is fetched, and the note names the WS-3 deferral.
++    Uses the DEFAULT fetcher — with no documents it makes no request."""
++    config = _cfg(tmp_path, Source(name="TSMC Technology", url="https://pr.tsmc.com/english/news",
++                                   doc_type="foundry_announcement", source_tier=2))
++    report = run_ingest(config, sleeper=_no_sleep)
++    assert report.skipped == ["TSMC Technology"]
++    assert report.fetched == [] and report.unchanged == [] and report.errors == []
++    assert "WS-3" in report.note
++
++
++def test_non_pdf_magic_refused_per_doc(server, tmp_path):
++    server.routes["/page.html"] = _Served(body=b"<html>an index page</html>")
++    server.routes["/real.pdf"] = _Served(body=PDF)
++    html_url, pdf_url = _https(server, "/page.html"), _https(server, "/real.pdf")
++    config = _cfg(tmp_path, _source("TSMC", html_url, pdf_url))
++
++    report = _run(config)
++    assert report.errors == [(html_url, "not a PDF (magic bytes %PDF- missing)")]
++    assert report.fetched == [url_doc_id(pdf_url)]  # the batch continued
++    # refused bytes never landed content-addressed
++    stored = {p.name for p in config.paths.raw_dir.iterdir()}
++    assert stored == {hashlib.sha256(PDF).hexdigest(),
++                      hashlib.sha256(PDF).hexdigest() + SIDECAR_SUFFIX}
++
++
++def test_fetch_error_isolated(server, tmp_path):
++    """One bad URL (404 -> FetchError) doesn't sink the batch — and the error
++    reason is fixed text, no server body."""
++    server.routes["/good.pdf"] = _Served(body=PDF)
++    missing_url, good_url = _https(server, "/gone.pdf"), _https(server, "/good.pdf")
++    config = _cfg(tmp_path, _source("TSMC", missing_url, good_url))
++
++    report = _run(config)
++    assert report.fetched == [url_doc_id(good_url)]
++    assert len(report.errors) == 1
++    key, reason = report.errors[0]
++    assert key == missing_url and "http error status 404" in reason
++
++
++def test_idempotent_refetch_unchanged(server, tmp_path):
++    server.routes["/n2.pdf"] = _Served(body=PDF)
++    url = _https(server, "/n2.pdf")
++    config = _cfg(tmp_path, _source("TSMC", url))
++
++    first = _run(config)
++    assert first.fetched == [url_doc_id(url)] and first.unchanged == []
++    second = _run(config)  # identical bytes: the honest no-op, distinct from fetched
++    assert second.fetched == [] and second.unchanged == [url_doc_id(url)]
++    assert second.errors == []
++
++
++def test_rate_pacing_recorded(server, tmp_path):
++    """Min-interval pacing spans the WHOLE run (across sources): N requests,
++    N-1 sleeps of 60/rpm seconds, none before the first request."""
++    for i in range(4):
++        server.routes[f"/p{i}.pdf"] = _Served(body=PDF + str(i).encode())
++    config = _cfg(
++        tmp_path,
++        _source("A", _https(server, "/p0.pdf"), _https(server, "/p1.pdf"), _https(server, "/p2.pdf")),
++        _source("B", _https(server, "/p3.pdf")),
++        rpm=10,
++    )
++    sleeps: list[float] = []
++    report = _run(config, sleeper=sleeps.append)
++    assert len(report.fetched) == 4 and report.errors == []
++    assert sleeps == [6.0, 6.0, 6.0]  # 60/10 between consecutive requests
++
++
++def test_sidecar_fields_correct(server, tmp_path):
++    port = server.server_address[1]
++    # doc A sits behind a redirect: requested-url identity, final-url audit
++    server.routes["/move"] = _Served(status=302, headers={"Location": "/docs/n2_update.pdf"})
++    server.routes["/docs/n2_update.pdf"] = _Served(body=PDF)
++    server.routes["/b.pdf"] = _Served(body=PDF + b"b")  # distinct bytes: no S1 collision
++    requested_a = _https(server, "/move")
++    config = _cfg(
++        tmp_path,
++        _source("TSMC Technology", requested_a),                     # publisher falls back to name
++        _source("Samsung Foundry", _https(server, "/b.pdf"), publisher="Samsung"),
++    )
++
++    report = _run(config)
++    assert report.errors == []
++
++    meta_a = _sidecar(config, hashlib.sha256(PDF).hexdigest())
++    assert meta_a["doc_id"] == url_doc_id(requested_a) == f"127_0_0_1_{port}_move"
++    assert meta_a["url"] == _https(server, "/docs/n2_update.pdf")  # FINAL post-redirect URL
++    assert meta_a["title"] == "move"  # requested-URL path basename (display data)
++    assert meta_a["publisher"] == "TSMC Technology"  # fallback to source name
++    assert meta_a["doc_type"] == "foundry_announcement" and meta_a["source_tier"] == 2
++    assert meta_a["publish_date"] is None  # never guessed from untrusted headers
++    assert meta_a["ingest_date"] == dt.date.today().isoformat()
++    assert meta_a["file_sha256"] == hashlib.sha256(PDF).hexdigest()
++
++    meta_b = _sidecar(config, hashlib.sha256(PDF + b"b").hexdigest())
++    assert meta_b["publisher"] == "Samsung"  # explicit publisher wins over name
++
++
++def test_sidecar_collision_isolated(server, tmp_path):
++    """Same bytes served at two URLs: the second sidecar write is an S1
++    collision — reported per-document, first binding intact, batch continues."""
++    server.routes["/a.pdf"] = _Served(body=PDF)
++    server.routes["/dup.pdf"] = _Served(body=PDF)          # identical bytes
++    server.routes["/c.pdf"] = _Served(body=PDF + b"c")     # distinct third doc
++    url_a, url_dup, url_c = (_https(server, p) for p in ("/a.pdf", "/dup.pdf", "/c.pdf"))
++    config = _cfg(tmp_path, _source("TSMC", url_a, url_dup, url_c))
++
++    report = _run(config)
++    assert report.fetched == [url_doc_id(url_a), url_doc_id(url_c)]  # batch continued past the collision
++    assert len(report.errors) == 1
++    key, reason = report.errors[0]
++    assert key == url_doc_id(url_dup) and "refusing to rebind" in reason
++    # the first ingest's identity binding is intact
++    assert _sidecar(config, hashlib.sha256(PDF).hexdigest())["doc_id"] == url_doc_id(url_a)
++
++
++# --------------------------------------------------------------------------
++# E2E: run_ingest -> run_extract (replay) -> revision -> supersession
++# --------------------------------------------------------------------------
++def _counts(config: Config) -> dict[str, int]:
++    conn = store.connect(config.paths.db_path)
++    try:
++        return store.table_counts(conn)
++    finally:
++        conn.close()
++
++
++def _stored_shas(config: Config) -> dict[str, str]:
++    conn = store.connect(config.paths.db_path)
++    try:
++        return store.stored_doc_shas(conn)
++    finally:
++        conn.close()
++
++
++def test_revision_changed_bytes_supersedes_e2e(server, tmp_path):
++    """The full live chain over the REAL run_ingest + run_extract: fetch ->
++    sidecar -> extract (replay), then the server silently revises the bytes at
++    the same URL -> re-ingest needs no special handling (new blob, same
++    doc_id) -> run_extract's revision path supersedes via refold — the store
++    reflects ONLY the revision."""
++    v1 = (CASE_DIR / "raw.pdf").read_bytes()
++    server.routes["/tsmc/raw.pdf"] = _Served(body=v1)
++    url = _https(server, "/tsmc/raw.pdf")
++    doc_id = url_doc_id(url)
++    config = _cfg(tmp_path, _source("TSMC Technology", url, publisher="TSMC"))
++    store.init_db(config)
++
++    assert _run(config).fetched == [doc_id]
++    rep = run_extract(config, extractor=AnthropicExtractor(
++        ReplayModelClient((CASE_DIR / "llm_response.json").read_text())))
++    assert rep.extracted == [doc_id] and rep.errors == []
++    assert run_analysis(config).assessments[0].value_range == [1.15, 1.15]
++
++    # The source revises the document in place: changed bytes, same URL (same
++    # identity), appended junk parses to identical text; the recorded value
++    # changes so the fold winner is observable.
++    v2 = v1 + b"%% corrected\n"
++    server.routes["/tsmc/raw.pdf"] = _Served(body=v2)
++    again = _run(config)
++    assert again.fetched == [doc_id] and again.unchanged == []  # new bytes ARE a fetch
++    recorded = json.loads((CASE_DIR / "llm_response.json").read_text())
++    recorded["claims"][0]["value"] = 1.30  # quote_span unchanged, still grounded
++    rep = run_extract(config, extractor=AnthropicExtractor(ReplayModelClient(json.dumps(recorded))))
++    assert rep.revised == [doc_id] and rep.extracted == [] and rep.errors == []
++
++    # Only the revision survives the fold.
++    assert _counts(config)["document"] == 1 and _counts(config)["claim"] == 1
++    assert _stored_shas(config)[doc_id] == hashlib.sha256(v2).hexdigest()
++    assert run_analysis(config).assessments[0].value_range == [1.30, 1.30]
++
++    # Steady state: re-fetch is unchanged, re-extract skips both byte-states
++    # (v1's retained artifact is an honest skip — anti-ping-pong).
++    third = _run(config)
++    assert third.fetched == [] and third.unchanged == [doc_id]
++    rep = run_extract(config, extractor=AnthropicExtractor(ReplayModelClient(json.dumps(recorded))))
++    assert rep.extracted == [] and rep.revised == [] and rep.errors == []
++    assert rep.skipped.count(doc_id) == 2

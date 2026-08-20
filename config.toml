@@ -15,26 +15,34 @@ raw_dir  = "data/raw"          # content-addressed raw docs, keyed by sha256
 db_path  = "data/semianalyst.db"
 
 [rate_limits]
-# Applied by the ingest fetchers once network fetch lands.
+# Applied by `semianalyst ingest` (run_ingest): sequential fetching with a
+# min-interval sleep of 60/requests_per_minute seconds between requests.
 requests_per_minute = 10
 max_concurrency     = 2
 
 # Watchlist of sources. doc_type and source_tier map to the schema enums:
 #   source_tier: 1=conference, 2=foundry, 3=vendor
+# `url` is the source's index page (identification only this phase); `documents`
+# lists explicit document URLs to fetch — the WS-2b direct-URL scope. Discovering
+# document URLs by crawling the index page is HTML-discovery work, deferred to
+# WS-3. `publisher` (optional) names the sidecar publisher; defaults to `name`.
 [[sources]]
 name        = "TSMC Technology"
 url         = "https://pr.tsmc.com/english/news"
 doc_type    = "foundry_announcement"
 source_tier = 2
+# documents = ["https://pr.tsmc.com/english/news/<file>.pdf"]  # explicit URLs until WS-3 discovery
 
 [[sources]]
 name        = "Samsung Foundry"
 url         = "https://semiconductor.samsung.com/foundry/newsroom/"
 doc_type    = "foundry_announcement"
 source_tier = 2
+# documents = ["https://semiconductor.samsung.com/foundry/newsroom/<file>.pdf"]  # explicit URLs until WS-3 discovery
 
 [[sources]]
 name        = "Intel Foundry"
 url         = "https://www.intel.com/content/www/us/en/newsroom/home.html"
 doc_type    = "foundry_announcement"
 source_tier = 2
+# documents = ["https://www.intel.com/content/dam/www/central-libraries/us/en/documents/<file>.pdf"]  # explicit URLs until WS-3 discovery
