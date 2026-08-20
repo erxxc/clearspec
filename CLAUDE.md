@@ -99,7 +99,13 @@ outside it is WS-2b+ scope). `forget <doc_id>` moves sidecar+artifact to
 `data/quarantine/` (never deletes — blobs stay, content-addressed), refolds,
 and FAILS LOUD if the doc_id survives the refold — the retraction primitive
 every flag-terminated defense resolves into, and it must never report success
-while retracting nothing. A revision (same doc_id, CHANGED bytes) is EXTRACTED
+while retracting nothing. Its mirror image (WS-2b gate, devils-advocate):
+`run_ingest` REFUSES to implicitly revive a quarantined doc_id — without the
+guard a routine watchlist re-run would silently re-create the sidecar (the
+blob survives quarantine, so no S1 collision fires) and the next extract would
+restore the retracted document as an ordinary unknown doc_id. Revival is an
+explicit operator act: `ingest-file`, or clearing the quarantined record.
+A revision (same doc_id, CHANGED bytes) is EXTRACTED
 and supersedes via refold (WS-1's deferred supersession: retired); an
 already-superseded byte-state re-offered is skipped (anti-ping-pong).
 Incremental state and rebuilt state must stay equal — tested, including with
@@ -162,16 +168,27 @@ normalization can't close); **identity citation slots** for `name`/`vendor`/
 (a Latin/Cyrillic/Greek lookalike swap defeats fold-based comparison in G3, H1,
 and J simultaneously — precommit gate, injection F2; trigger: the honest
 fixtures now exist, land it when a live corpus shows a homoglyph case, inside
-`textnorm.fold`); **display of `quote_span`/`stated_caveats` — OPEN** (stored
+`textnorm.fold`); **wall-clock fetch deadline** (WS-2b gate: the per-read
+socket timeout re-arms on every read, so a slow-loris host can stall a
+sequential ingest run indefinitely; trigger: a live run demonstrably hangs, or
+the watchlist grows beyond a handful of hosts); **display of
+`quote_span`/`stated_caveats`/`document.url` — OPEN** (the first two stored
 VERBATIM by design, length-bounded only: raw escapes and Trojan-Source
-codepoints persist in DB and artifacts; `report` doesn't display them today,
-but any future evidence-display feature MUST route them through `_ansi_safe` —
+codepoints persist in DB and artifacts; `url` is the FINAL post-redirect URL
+for network-fetched docs — server-controlled text in the same trust class,
+WS-2b gate; `report` doesn't display any of them today, but any future
+evidence-display or audit-trail feature MUST route them through `_ansi_safe` —
 the "every DB-derived display string" guarantee covers currently-displayed
 fields only). Residual risks accepted at the gate: shell-publisher collusion
 passes H1; a tampered sidecar `file_sha256` FIELD (S2 verifies the blob against
 the filename hash only); an `_extracted_at` inside an artifact is
 attacker-writable text ordering the fold — bounded by the `data/raw/` trust
-boundary above.
+boundary above; SSRF-via-redirect (WS-2b gate: HTTPS-only-per-hop constrains
+scheme, never destination — a redirect to an internal/link-local https host is
+followed; accepted because the watchlist is operator-curated and a
+resolved-address block would have to live above the transport seam, where it
+would break the entire local-server test suite; trigger to revisit: any
+non-operator-supplied URL source).
 `validate.py` enforces a per-DOCUMENT boundary; cross-document trust lives in
 store reconciliation + analyze floors, tested by the hostile suite.
 
@@ -192,8 +209,15 @@ carrying exactly the Document-construction metadata ingest knows (`doc_id`,
 `title`, `publisher`, `doc_type`, `source_tier`, `url`, `publish_date`,
 `ingest_date`, `file_sha256`) — **not** `extraction_model`, which `run_extract`
 stamps at extraction time. **Whatever produces the bytes writes the same sidecar
-shape** — the operator path `ingest.ingest_file` today, WS-2's network fetcher
-later — so `extract` stays fetch-source-agnostic. The `Document` row is created at
+shape** — the operator path `ingest.ingest_file` and WS-2b's network fetcher
+(`run_ingest`), both live — so `extract` stays fetch-source-agnostic. The `url`
+field's SEMANTICS differ by producer (same shape, documented divergence, WS-2b
+gate): `ingest_file` records the operator-typed URL verbatim; `run_ingest`
+records the FINAL post-redirect URL as the audit trail. Fetched-doc IDENTITY is
+never the final URL: `url_doc_id` keys on the exact operator-typed requested
+URL (readable host+path slug + unconditional `_` + sha256(url)[:8] suffix —
+the suffix closes cross-run collisions between distinct URLs whose slugs
+coincide, e.g. query-string-only differences). The `Document` row is created at
 **extract** time (`persist_extraction` inserts it, unchanged), not at ingest.
 `run_extract` classifies each sidecar against `store.stored_doc_shas` (doc_id →
 file_sha256): unknown doc_id → extract; same doc_id + same bytes → idempotent skip;
@@ -213,8 +237,9 @@ gitignored in full.
 
 ## Module map
 - `ingest/`  — fetchers + content-addressed raw storage + provenance sidecars +
-  extraction-artifact layout + `forget` quarantine (`ingest_file` operator path
-  live; network fetch: WS-2b)
+  extraction-artifact layout + `forget` quarantine (operator path AND the
+  WS-2b direct-URL network fetcher both live; HTML discovery of document URLs
+  from index pages: WS-3)
 - `extract/` — raw doc → schema records via a versioned prompt; `run_extract`
   wires ingest (sidecar) → extractor → `persist_extraction` + artifact;
   `run_rebuild` refolds the DB from artifacts

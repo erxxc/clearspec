@@ -57,7 +57,7 @@ class IngestReport:
     fetched: list[str] = field(default_factory=list)    # doc_ids whose bytes are NEW in data/raw/ (first fetch OR a revision)
     unchanged: list[str] = field(default_factory=list)  # identical bytes re-fetched — the honest no-op, distinct from fetched
     skipped: list[str] = field(default_factory=list)    # sources with no documents configured (HTML discovery: WS-3)
-    errors: list[tuple[str, str]] = field(default_factory=list)  # (requested_url|doc_id, fixed reason) — per-doc isolation
+    errors: list[tuple[str, str]] = field(default_factory=list)  # (requested_url, fixed reason) — per-doc isolation, one key semantic
     note: str = ""
 
 
@@ -74,32 +74,69 @@ _SLUG_HASH_LEN = 8
 
 
 def url_doc_id(url: str) -> str:
-    """Deterministic doc_id for a fetched document: host+path of the REQUESTED
-    URL, lowercased, runs of non-[a-z0-9] collapsed to '_', stripped; when that
-    exceeds 111 chars it is truncated and suffixed with '_' + sha256(url)[:8]
-    so two long URLs sharing a prefix stay distinct (120 chars total — exactly
-    DocId120's bound, whose charset permits '_').
+    """Deterministic doc_id for a fetched document: a readable slug of the
+    REQUESTED URL's host+path (lowercased, runs of non-[a-z0-9] collapsed to
+    '_', stripped, truncated to 111 chars) plus an UNCONDITIONAL suffix of
+    '_' + sha256(full url)[:8] — at most 120 chars, exactly DocId120's bound.
 
-    Identity is the OPERATOR-TYPED (requested) URL, never the post-redirect
-    final one: the redirect target is server-controlled and can change per
-    fetch, so keying identity on it would let a hostile or flaky server mint a
-    fresh doc_id on every fetch (each revision arrives as a "new" document,
-    defeating same-doc_id supersession) or steer two watchlist entries onto
-    one doc_id. URL = identity, content = version (plan §1); the final URL is
-    still recorded in the sidecar for audit. Distinct short URLs that slug
-    identically are an accepted residual surfaced by analyze's
-    `possible_slug_collision` advisory (J), never silently merged bytes —
-    each revision is its own blob + sidecar.
+    Identity is the EXACT operator-typed URL string; the slug is a display
+    affordance and the hash suffix is the discriminator. The suffix is
+    unconditional (WS-2b precommit gate, schema-purist HIGH + devils-advocate):
+    the slug alone drops query/case/fragment, so two distinct configured URLs
+    (`?id=1234` vs `?id=5678`) would collapse into one doc_id and silently
+    supersede each other's claims on refold — across RUNS, which no in-run
+    preflight can catch. (An earlier docstring claimed analyze's
+    `possible_slug_collision` advisory covered this; it does not — that
+    advisory guards ENTITY slugs, not doc_ids.)
+
+    Identity is never the post-redirect final URL: the redirect target is
+    server-controlled and can change per fetch, so keying identity on it would
+    let a hostile or flaky server mint a fresh doc_id on every fetch (each
+    revision arrives as a "new" document, defeating same-doc_id supersession)
+    or steer two watchlist entries onto one doc_id. URL = identity, content =
+    version (plan §1); the final URL is still recorded in the sidecar for
+    audit. Cost accepted at the gate: an operator retyping a URL with a
+    trivial textual difference (trailing slash, host case) mints a new
+    identity — operator-controlled and visible, unlike the silent collapse.
     """
     parts = urlsplit(url)
     slug = re.sub(r"[^a-z0-9]+", "_", f"{parts.netloc}{parts.path}".lower()).strip("_")
-    if len(slug) > _SLUG_MAX:
-        digest = hashlib.sha256(url.encode()).hexdigest()[:_SLUG_HASH_LEN]
-        slug = f"{slug[:_SLUG_MAX]}_{digest}"
-    # A URL with an empty host+path slug can't happen for a fetchable https URL
-    # (the fetcher requires a netloc), but fail toward a valid, deterministic
-    # id rather than an empty string DocId120 would reject.
-    return slug or f"doc_{hashlib.sha256(url.encode()).hexdigest()[:16]}"
+    digest = hashlib.sha256(url.encode()).hexdigest()[:_SLUG_HASH_LEN]
+    # An empty host+path slug can't happen for a fetchable https URL (the
+    # fetcher requires a netloc), but fail toward a valid DocId120 first char.
+    return f"{(slug or 'doc')[:_SLUG_MAX]}_{digest}"
+
+
+def _retracted_doc_ids(config: Config) -> set[str]:
+    """doc_ids with a sidecar under data/quarantine/ — retracted via `forget`.
+
+    run_ingest refuses to implicitly revive these (WS-2b precommit gate,
+    devils-advocate): forget quarantines the sidecar+artifact but leaves the
+    content-addressed blob, so before this guard a routine watchlist re-run
+    would silently re-create the sidecar and the next extract would restore
+    the retracted document — a retraction that reports success and then
+    un-happens on the next scheduled command. Explicit revival stays available
+    via `ingest-file` (a deliberate operator act), or by clearing the
+    quarantined record. Unreadable quarantined sidecars are skipped: they
+    can't be matched by doc_id, same posture as forget's own scan.
+    """
+    quarantine_dir = config.paths.data_dir / QUARANTINE_DIRNAME
+    if not quarantine_dir.exists():
+        return set()
+    retracted: set[str] = set()
+    # _quarantine_dest suffixes repeats as `<name>.1`, `<name>.2`, ... — match
+    # any file carrying the sidecar suffix anywhere in its name.
+    for path in sorted(quarantine_dir.iterdir()):
+        if SIDECAR_SUFFIX not in path.name:
+            continue
+        try:
+            meta = json.loads(path.read_text())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        doc_id = meta.get("doc_id")
+        if isinstance(doc_id, str):
+            retracted.add(doc_id)
+    return retracted
 
 
 def _url_title(url: str) -> str:
@@ -137,13 +174,11 @@ def run_ingest(
     config = config or load_config()
     fetcher = fetcher or FoundryFetcher()
     report = IngestReport()
+    retracted = _retracted_doc_ids(config)
 
-    rpm = config.rate_limits.requests_per_minute
-    if rpm <= 0:
-        # Fail loud, never reinterpret: rounding 0 up to some rate would fetch
-        # FASTER than the operator configured — the wrong fail direction.
-        raise ValueError("rate_limits.requests_per_minute must be positive to fetch")
-    interval = 60.0 / rpm
+    # requests_per_minute > 0 is a pydantic constraint on RateLimits — an
+    # invalid config fails loud at load/construction, never here.
+    interval = 60.0 / config.rate_limits.requests_per_minute
     requested_before = False  # no sleep before the run's very first request
 
     def pace() -> None:
@@ -165,12 +200,23 @@ def run_ingest(
             documents=source.documents,
         )
         for outcome in fetcher.fetch(ref, config.paths.raw_dir, pace=pace):
-            if outcome.error is not None or outcome.raw is None:
-                report.errors.append(
-                    (outcome.requested_url, outcome.error or "fetcher returned no blob")
-                )
+            if outcome.error is not None:
+                # FetchOutcome enforces success XOR error at construction, so
+                # error's presence alone is decisive here.
+                report.errors.append((outcome.requested_url, outcome.error))
                 continue
             doc_id = url_doc_id(outcome.requested_url)
+            if doc_id in retracted:
+                # Refuse implicit revival of a forgotten document (see
+                # _retracted_doc_ids). The fetched bytes stay content-addressed
+                # in data/raw/ but a blob without a sidecar is inert.
+                report.errors.append((
+                    outcome.requested_url,
+                    "doc_id was retracted by forget; remove the URL from the "
+                    "watchlist, or revive explicitly via ingest-file "
+                    "(quarantined record: data/quarantine/)",
+                ))
+                continue
             meta = {
                 "doc_id": doc_id,
                 "title": _url_title(outcome.requested_url),
@@ -191,7 +237,9 @@ def run_ingest(
             except SidecarCollision as exc:
                 # S1: these bytes are already bound to another doc_id — the
                 # first ingest's provenance wins; this URL's claim is refused.
-                report.errors.append((doc_id, str(exc)))
+                # Keyed by requested_url like every other error entry (gate:
+                # one key semantic); the colliding doc_ids are in the reason.
+                report.errors.append((outcome.requested_url, str(exc)))
                 continue
             (report.fetched if outcome.raw.is_new else report.unchanged).append(doc_id)
 
@@ -221,6 +269,11 @@ def ingest_file(
     The (doc_type, source_tier, publish_date) fields are recorded verbatim and
     validated at extract time when the Document is constructed (pydantic) — ingest
     stays decoupled from the store's model. Returns the stored RawDoc.
+
+    Re-ingesting a forgotten doc_id here is the EXPLICIT revival path — a
+    deliberate operator act with typed flags. `run_ingest` refuses the implicit
+    equivalent (a quarantined doc_id resurfacing via the watchlist); this
+    function deliberately does not.
     """
     content = Path(source_path).read_bytes()
     raw = store_raw(content, config.paths.raw_dir)

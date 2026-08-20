@@ -73,6 +73,14 @@ class FetchOutcome:
     raw: RawRef | None = None
     error: str | None = None
 
+    def __post_init__(self) -> None:
+        # Enforce the XOR at construction (WS-2b precommit gate, schema-purist):
+        # "code-enforced, not trusted to the caller" applies to our own
+        # dataclass contracts too — a Fetcher returning both-or-neither is a
+        # bug surfaced here, not downstream ambiguity.
+        if (self.raw is None) == (self.error is None):
+            raise ValueError("FetchOutcome requires exactly one of raw or error")
+
 
 @dataclass(frozen=True)
 class RawDoc:

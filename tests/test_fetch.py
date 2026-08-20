@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from semianalyst import store
 from semianalyst.analyze import run_analysis
@@ -38,6 +39,8 @@ from semianalyst.ingest import (
     url_doc_id,
 )
 from semianalyst.ingest import fetch as fetchmod
+from semianalyst.ingest.base import FetchOutcome, RawRef
+from semianalyst.ingest.pipeline import forget
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 CASE_DIR = FIXTURES_DIR / "tsmc_n2_2025"
@@ -213,13 +216,25 @@ def test_looks_like_pdf():
 # doc_id slug — deterministic identity from the REQUESTED URL
 # --------------------------------------------------------------------------
 def test_url_doc_id_slug():
-    assert (url_doc_id("https://PR.TSMC.com/English/News/N2-Update.pdf")
-            == "pr_tsmc_com_english_news_n2_update_pdf")
+    url = "https://PR.TSMC.com/English/News/N2-Update.pdf"
+    expected_hash = hashlib.sha256(url.encode()).hexdigest()[:8]
+    doc = url_doc_id(url)
+    assert doc == f"pr_tsmc_com_english_news_n2_update_pdf_{expected_hash}"
+    assert DOC_ID_120.fullmatch(doc)
     # runs of non-[a-z0-9] collapse to one '_'; leading/trailing stripped
-    assert url_doc_id("https://a.com//x..y/") == "a_com_x_y"
-    # host+path only: the query is not identity (distinct-URL conflation is the
-    # accepted residual behind analyze's possible_slug_collision advisory, J)
-    assert url_doc_id("https://a.com/x.pdf?v=2") == url_doc_id("https://a.com/x.pdf")
+    assert url_doc_id("https://a.com//x..y/").startswith("a_com_x_y_")
+
+
+def test_url_doc_id_distinct_urls_never_collide():
+    """Identity is the EXACT operator-typed URL string: the UNCONDITIONAL hash
+    suffix keeps distinct configured URLs distinct even when their host+path
+    slugs are identical (query strings, case) — without it, ?id=1234 vs
+    ?id=5678 would collapse into one doc_id and silently supersede each
+    other's claims on refold, across runs (WS-2b precommit gate)."""
+    assert url_doc_id("https://a.com/x.pdf?v=2") != url_doc_id("https://a.com/x.pdf")
+    assert url_doc_id("https://a.com/x.pdf?id=1234") != url_doc_id("https://a.com/x.pdf?id=5678")
+    # deterministic across calls/runs — a re-fetch keys the same identity
+    assert url_doc_id("https://a.com/x.pdf?v=2") == url_doc_id("https://a.com/x.pdf?v=2")
 
 
 def test_url_doc_id_truncation_hash():
@@ -323,7 +338,9 @@ def test_sidecar_fields_correct(server, tmp_path):
     assert report.errors == []
 
     meta_a = _sidecar(config, hashlib.sha256(PDF).hexdigest())
-    assert meta_a["doc_id"] == url_doc_id(requested_a) == f"127_0_0_1_{port}_move"
+    assert meta_a["doc_id"] == url_doc_id(requested_a)
+    assert meta_a["doc_id"].startswith(f"127_0_0_1_{port}_move_")  # slug + hash suffix
+    assert DOC_ID_120.fullmatch(meta_a["doc_id"])
     assert meta_a["url"] == _https(server, "/docs/n2_update.pdf")  # FINAL post-redirect URL
     assert meta_a["title"] == "move"  # requested-URL path basename (display data)
     assert meta_a["publisher"] == "TSMC Technology"  # fallback to source name
@@ -349,9 +366,59 @@ def test_sidecar_collision_isolated(server, tmp_path):
     assert report.fetched == [url_doc_id(url_a), url_doc_id(url_c)]  # batch continued past the collision
     assert len(report.errors) == 1
     key, reason = report.errors[0]
-    assert key == url_doc_id(url_dup) and "refusing to rebind" in reason
+    # keyed by requested_url like every other error entry (one key semantic);
+    # the colliding doc_ids are named inside the reason text
+    assert key == url_dup and "refusing to rebind" in reason
     # the first ingest's identity binding is intact
     assert _sidecar(config, hashlib.sha256(PDF).hexdigest())["doc_id"] == url_doc_id(url_a)
+
+
+def test_forget_then_ingest_refuses_revival(server, tmp_path):
+    """forget -> a routine watchlist re-run must NOT resurrect the retracted
+    document (WS-2b precommit gate, devils-advocate): the blob survives
+    quarantine by design, so without the guard run_ingest would silently
+    re-create the sidecar (no S1 collision — the original was moved away) and
+    the next extract would restore the doc as an ordinary unknown doc_id. The
+    refusal is LOUD (an error entry), never an `unchanged` line; explicit
+    revival stays available via ingest-file."""
+    server.routes["/n2.pdf"] = _Served(body=PDF)
+    url = _https(server, "/n2.pdf")
+    doc_id = url_doc_id(url)
+    config = _cfg(tmp_path, _source("TSMC", url))
+    store.init_db(config)
+
+    assert _run(config).fetched == [doc_id]
+    assert forget(config, doc_id).quarantined  # sidecar now under data/quarantine/
+
+    again = _run(config)
+    assert again.fetched == [] and again.unchanged == []
+    assert len(again.errors) == 1
+    key, reason = again.errors[0]
+    assert key == url and "retracted by forget" in reason
+    sha = hashlib.sha256(PDF).hexdigest()
+    assert not (config.paths.raw_dir / f"{sha}{SIDECAR_SUFFIX}").exists()  # no revived sidecar
+    assert (config.paths.raw_dir / sha).exists()  # blobs stay, content-addressed
+
+
+def test_fetch_outcome_success_xor_error():
+    """The XOR is code-enforced at construction, not a docstring convention: a
+    Fetcher implementation returning both-or-neither is a bug surfaced
+    immediately, never downstream ambiguity in run_ingest's bucketing."""
+    ok = RawRef(sha256="0" * 64, path=Path("blob"), is_new=True)
+    with pytest.raises(ValueError, match="exactly one of raw or error"):
+        FetchOutcome(requested_url="https://a.com/x.pdf")  # neither
+    with pytest.raises(ValueError, match="exactly one of raw or error"):
+        FetchOutcome(requested_url="https://a.com/x.pdf", raw=ok, error="boom")  # both
+
+
+def test_rate_limit_must_be_positive():
+    """Invalid pacing config fails loud at construction (pydantic gt=0), not
+    mid-run: rounding 0 up to some rate would fetch FASTER than configured —
+    the wrong fail direction."""
+    with pytest.raises(ValidationError):
+        RateLimits(requests_per_minute=0)
+    with pytest.raises(ValidationError):
+        RateLimits(requests_per_minute=-5)
 
 
 # --------------------------------------------------------------------------
