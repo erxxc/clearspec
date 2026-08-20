@@ -15,11 +15,15 @@ grounded `ExtractionResult`, enforcing the schema's integrity rules in code:
                    absolute one); a pure-ratio unit (x) requires is_relative; a
                    relative claim with no baseline is downgraded to
                    missing_baseline (the model's `completeness` is not trusted);
-                   sparsity + cross-vendor comparison -> marketing_only.
+                   sparsity + cross-vendor comparison -> marketing_only;
+                   sparse-benchmark vocabulary in the grounded quote_span
+                   force-sets sparsity=True (self-declaration is not trusted in
+                   the non-suspect direction — fails toward suspect).
   6. Fail-safe   — flat-text extraction can't place a quote, so every citation's
                    location_type is forced to `unknown` (never `body`).
-  7. Dedup       — one entity per (vendor, name); aliases, attribute VALUES, and
-                   their citations are all reconciled into the surviving entity.
+  7. Dedup       — one entity per (vendor, name), both case-folded; aliases,
+                   attribute VALUES, and their citations are all reconciled into
+                   the surviving entity.
                    The canonical `name` is always pinned into `aliases` — it is a
                    surface form of the entity, and models repeat it inconsistently.
 
@@ -97,6 +101,15 @@ GROUNDABLE: dict[str, list[str]] = {
 _VALID_PATHS = {f"{sub}.{f}" for sub, fields in GROUNDABLE.items() for f in fields}
 
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
+
+# Sparse-benchmark vocabulary (v1, 2026-08-18 gate — injection F1, a live bug):
+# conditions.sparsity is model-proposed, and a hostile document can steer the
+# model to omit or deny the disclosure. The quote_span is already grounded, so
+# its own vocabulary overrides the model's self-declaration — presence of any
+# term force-sets sparsity=True. Fails toward suspect, never toward clean (the
+# same fail-safe direction as location_type). `2:4` is the structured-sparsity
+# ratio notation; \b keeps it from matching inside clock times like "12:45".
+_SPARSE_VOCAB_V1 = re.compile(r"(?i)\b(spars\w*|prun\w*|2:4)\b")
 
 
 def _safe(text: str) -> str:
@@ -201,7 +214,9 @@ def validate_proposal(
             else:
                 _force_unknown(ent.attribute_citations[path])
 
-        key = (ent.vendor, ent.name.strip().lower())
+        # Vendor is case-folded like name: one document's "TSMC"/"Tsmc" is one
+        # vendor, not two entities (2026-08-18 gate, schema-purist risk).
+        key = (ent.vendor.strip().lower(), ent.name.strip().lower())
         if key in seen:
             base = seen[key]
             for alias in ent.aliases:
@@ -253,6 +268,13 @@ def validate_proposal(
             rejections.append(Rejection("claim", claim.claim_id,
                                         "quote_span not found in source"))
             continue
+        # Sparse-benchmark vocabulary in the (now grounded) quote_span force-sets
+        # sparsity=True — the self-declaration is not trusted in the non-suspect
+        # direction. Must run before the marketing_only check below, which reads it.
+        if claim.conditions.sparsity is not True and _SPARSE_VOCAB_V1.search(claim.citation.quote_span):
+            claim.conditions.sparsity = True
+            rejections.append(Rejection("claim_condition", claim.claim_id,
+                                        "sparsity forced true: sparse-benchmark vocabulary in quote_span"))
         # A relative claim must express relative magnitude (ratio or percent),
         # never an absolute measurement unit.
         if claim.comparison.is_relative and claim.unit not in RELATIVE_OK_UNITS:
