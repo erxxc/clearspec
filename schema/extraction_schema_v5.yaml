@@ -93,7 +93,7 @@ claim:
   version_range: version_range?  # required for affected_range / patched_in
   exploit_status: enum?     # known_exploited | no_known_exploit | disputed
   workaround_text: string?
-  source_record_kind: enum? # required for advisory claim_class
+  source_record_kind: enum? # ingest-attested (sidecar / CNA-vs-CPE parser); SQL-required for advisory; model must not emit
   comparison:
     is_relative: boolean
     baseline_entity: entity_id?
