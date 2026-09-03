@@ -291,7 +291,7 @@ def test_nvd_cna_and_nvd_cpe_are_distinct_records_same_url(tmp_config):
 def test_validate_advisory_claim_grounding():
     """version_bound.version must appear in the quote/source (1.1.11).
 
-    Inferring exclusive bound 1.1.12 from "1.1.11 and earlier" is GEI-8
+    Inferring exclusive bound 1.1.12 from \"1.1.11 and earlier\" is GEI-8
     interval inference — not allowed golden for this pack.
     """
     proposal = {
@@ -328,12 +328,26 @@ def test_validate_advisory_claim_grounding():
     assert any(r.kind == "claim_kind" for r in rej)
 
 
-def test_interval_inference_1_1_12_is_gei8_not_golden():
-    """Do not freeze '1.1.12' inferred from '1.1.11 and earlier' as allowed."""
-    pytest.xfail(
-        "GEI-8: version_bound.version '1.1.12' is not in quote/source "
-        "('1.1.11 and earlier'); interval inference is extract_advisory_v1"
-    )
+def test_interval_inference_1_1_12_is_gei8_not_golden(tmp_config):
+    """1.1.12 inferred from '1.1.11 and earlier' is rejected and not persisted."""
+    proposal = _advisory_proposal()
+    proposal["claims"][0]["version_range"] = {
+        "intervals": [{"end": {"version": "1.1.12", "inclusive": False}}]
+    }
+    result, rej = validate_proposal(proposal, _ADVISORY_SRC)
+    assert result.claims == []
+    assert any("version_bound" in r.reason for r in rej)
+    store.init_db(tmp_config)
+    conn = store.connect(tmp_config.paths.db_path)
+    try:
+        store.persist_extraction(
+            conn, _doc("nvd_21626"), result.entities, result.claims,
+            source_record_kind=store.attested_kind("nvd_record", "cpe"),
+        )
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) AS n FROM claim").fetchone()["n"] == 0
+    finally:
+        conn.close()
 
 
 def test_cvss_kind_optional_at_pydantic():
