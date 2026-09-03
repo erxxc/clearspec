@@ -1,40 +1,8 @@
 """analyze — cross-source corroboration and divergence (v1 + WS-2a floors).
 
-Reads claims (joined to their document's source_tier and publisher) from the
-store, groups them by (entity, normalized metric, is_relative, baseline,
-normalized unit), and assigns each group a corroboration verdict. Read-only over
-the store; derives on read (does not mutate `claim.corroboration`).
-
-Verdict rules:
-  - Compare only within a shared (metric, is_relative, baseline, unit) group.
-    `metric` and `unit` are normalized (casefold + whitespace collapse) for the
-    group KEY — they are attacker-influenceable free text, and a one-character
-    variant must not opt a hostile claim out of divergence detection
-    (2026-08-18 gate, Challenge 3). Display keeps the stored string.
-  - A SUSPECT member (sparsity=true or completeness=marketing_only) may ride
-    along but does NOT count toward the >=2 needed for `corroborated`.
-  - H1 (publisher-diversity floor, 2026-08-18 gate): `corroborated` additionally
-    requires the agreeing non-suspect members to span >=2 distinct NORMALIZED
-    publishers; a single-publisher agreement demotes to `weakly_corroborated`
-    + `single_publisher`. This is honestly a publisher/OPERATOR-diversity floor
-    (publishers come from the operator's watchlist in WS-2b's direct-URL scope),
-    not a hostile-input defense. H2 (all-tier-3 confidence cap) is DEFERRED —
-    trigger: the watchlist carries >=2 distinct tier-3 publishers for one metric
-    (docs/ROADMAP.md).
-  - status: singleton -> uncorroborated; spread beyond tolerance -> contradicted;
-    >=2 non-suspect within tolerance across >=2 publishers -> corroborated;
-    else -> weakly_corroborated.
-  - Advisory flags (never change a verdict): `possible_split_metric` — two
-    groups differing only by a near-identical metric string (the evasion
-    residue normalization can't close); `possible_slug_collision` (J) — two
-    stored entities sharing (entity_type, vendor) with overlapping surface
-    forms; `identity_conflict` — the entity has persisted reconciliation
-    conflicts (see store.get_conflicts; values surface via `report` through the
-    hardened sanitizer only).
-
-Remaining hostile-input guards (tier-precedence K3 stays deliberately tier-blind
-— see _assess; controlled metric vocabulary; identity citation slots) are
-resolved or deferred per docs/reviews/2026-08-18-live-ingest-plan/resolution.md.
+Advisory claim_class values are excluded from the foundry ±10% ruler (GEI-9
+owns version-range grouping). This is a skip, not a resolver — no path picks
+a winning source_record_kind.
 """
 
 from __future__ import annotations
@@ -57,8 +25,7 @@ from ..store import (
 )
 
 TOLERANCE_PCT = 10.0
-_SPLIT_METRIC_RATIO = 0.85   # SequenceMatcher ratio at/above which two distinct
-                             # metric strings are flagged as a possible split group
+_SPLIT_METRIC_RATIO = 0.85
 
 _CONFIDENCE = {
     "corroborated": "high",
@@ -67,9 +34,10 @@ _CONFIDENCE = {
     "uncorroborated": "none",
 }
 
-# The SHARED fold (textnorm): grouping, the H1 publisher floor, and J's
-# surface-form intersection all answer "same value?" exactly as validate's
-# dedup key and reconcile's identity/alias compares do — one implementation.
+_ADVISORY_CLASSES = {
+    "affected_range", "patched_in", "cvss", "exploit_status", "workaround",
+}
+
 _norm_key = fold
 
 
@@ -112,9 +80,6 @@ class AnalysisReport:
             "entities_reconciled": self.entities_reconciled,
             "assessments": [a.to_dict() for a in self.assessments],
         }
-        # Serialized only when present: a conflict-free store keeps the v3 dict
-        # shape byte-for-byte, so the honest-corpus fixtures stay stable
-        # (2026-08-18 gate, Challenge 4 — the flag budget's serialization twin).
         if self.conflicts:
             d["conflicts"] = [c.model_dump(mode="json") for c in self.conflicts]
             d["conflict_counts"] = dict(self.conflict_counts)
@@ -127,18 +92,13 @@ def _suspect(claim: ClaimView) -> bool:
 
 def _assess(group: list[ClaimView], entity_ids: set[str]) -> Assessment:
     members = sorted(group, key=lambda c: c.claim_id)
-    values = [c.value for c in members]
-    lo, hi = min(values), max(values)
-    # Spread as a % of the larger-magnitude endpoint, NOT of `lo`. Dividing by
-    # `lo` detonates when lo == 0 (a legal "0 defects"/"0%" claim): the old
-    # `if lo else 0.0` guard reported spread 0.0 for a group like [0.0, 40.0],
-    # i.e. a FALSE "corroborated/high" on two numbers that agree on nothing. The
-    # max-magnitude denominator is finite for any non-[0,0] group and preserves
-    # every status the golden asserts. (Whether an *absolute* claim deserves an
-    # *absolute* tolerance rather than this relative %, is an open decision — see
-    # CLAUDE.md; today the only absolute claim is a singleton, so it's moot.)
-    denom = max(abs(lo), abs(hi))
-    spread = 0.0 if denom == 0 else round((hi - lo) / denom * 100, 1)
+    values = [c.value for c in members if c.value is not None]
+    if not values:
+        lo, hi, spread = 0.0, 0.0, 0.0
+    else:
+        lo, hi = min(values), max(values)
+        denom = max(abs(lo), abs(hi))
+        spread = 0.0 if denom == 0 else round((hi - lo) / denom * 100, 1)
     tiers = sorted({c.source_tier for c in members})
     non_suspect = [c for c in members if not _suspect(c)]
     baseline = members[0].baseline_entity
@@ -158,9 +118,6 @@ def _assess(group: list[ClaimView], entity_ids: set[str]) -> Assessment:
     elif spread > TOLERANCE_PCT:
         status = "contradicted"
     elif len(non_suspect) >= 2:
-        # H1: agreement is only corroboration when it crosses a publisher
-        # boundary — one publisher agreeing with itself is one voice, however
-        # many PDFs it prints (2026-08-18 gate, Conflict 3 / §2.3).
         if len({_norm_key(c.publisher) for c in non_suspect}) >= 2:
             status = "corroborated"
         else:
@@ -171,18 +128,12 @@ def _assess(group: list[ClaimView], entity_ids: set[str]) -> Assessment:
 
     favored_tier = None
     if status == "contradicted":
-        # Report the highest-trust (lowest) tier present in the divergence. This
-        # is advisory surfacing, NOT enforcement: a suspect member is deliberately
-        # NOT excluded here (K3, ratified at the 2026-08-18 gate): suspect-ness is
-        # self-declared by the claim's own document, so excluding suspects would
-        # punish the honest discloser and reward the concealer. Tier-blind min
-        # preserves the honest discloser's tier authority.
         favored_tier = min(c.source_tier for c in members)
 
     return Assessment(
         entity_id=members[0].entity_id, metric=members[0].metric, baseline_entity=baseline,
         status=status, members=[c.claim_id for c in members],
-        value_range=[lo, hi], spread_pct=spread, tiers=tiers,
+        value_range=[lo, hi] if values else [0.0, 0.0], spread_pct=spread, tiers=tiers,
         confidence=_CONFIDENCE[status], flags=sorted(flags), favored_tier=favored_tier,
     )
 
@@ -193,10 +144,6 @@ def _add_flag(a: Assessment, flag: str) -> None:
 
 
 def _slug_collisions(entities: list[dict]) -> set[str]:
-    """J (advisory): entity_ids whose (entity_type, vendor) twin shares a surface
-    form (name or alias, normalized). Advisory, never fail-loud — a fail-loud
-    check would let a hostile alias DoS honest ingestion (G3 blocks the graft at
-    reconcile; this surfaces the residue)."""
     colliding: set[str] = set()
     for i in range(len(entities)):
         for j in range(i + 1, len(entities)):
@@ -224,14 +171,15 @@ def analyze_claims(
     entity_ids = set(entities_index)
     groups: dict[tuple, list[ClaimView]] = defaultdict(list)
     for claim in claims:
+        # GEI-9 owns advisory grouping; do not apply the foundry ±10% ruler
+        # and do not pick a winning source_record_kind.
+        if claim.claim_class in _ADVISORY_CLASSES:
+            continue
         groups[(claim.entity_id, _norm_key(claim.metric), claim.is_relative,
                 claim.baseline_entity, _norm_key(claim.unit))].append(claim)
 
     keyed = [(key, _assess(g, entity_ids)) for key, g in groups.items()]
 
-    # possible_split_metric: two groups identical but for a near-identical metric
-    # string — the evasion residue key normalization can't close (a controlled
-    # metric vocabulary is deferred; trigger in docs/ROADMAP.md).
     by_rest: dict[tuple, list[tuple[str, Assessment]]] = defaultdict(list)
     for (eid, met, rel, base, unit), a in keyed:
         by_rest[(eid, rel, base, unit)].append((met, a))
@@ -265,7 +213,6 @@ def analyze_claims(
 
 
 def run_analysis(config: Config | None = None) -> AnalysisReport:
-    """Library entry point behind `semianalyst report`. Read-only over the store."""
     config = config or load_config()
     conn = connect(config.paths.db_path)
     try:

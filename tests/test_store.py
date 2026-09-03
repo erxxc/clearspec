@@ -20,18 +20,18 @@ def test_init_db_creates_schema(tmp_config):
     try:
         assert {"document", "entity", "claim", "macro_snapshot", "schema_migrations"} <= _tables(conn)
         applied = conn.execute("SELECT version FROM schema_migrations").fetchall()
-        assert [r["version"] for r in applied] == [1, 2, 3, 4]  # + v4 conflicts & bounds
+        assert [r["version"] for r in applied] == [1, 2, 3, 4, 5]
     finally:
         conn.close()
 
 
 def test_init_db_is_idempotent(tmp_config):
     store.init_db(tmp_config)
-    store.init_db(tmp_config)  # second run must not re-apply or error
+    store.init_db(tmp_config)
     conn = store.connect(tmp_config.paths.db_path)
     try:
         n = conn.execute("SELECT COUNT(*) AS n FROM schema_migrations").fetchone()["n"]
-        assert n == 4  # all migrations applied once; second init_db is a no-op
+        assert n == 5
     finally:
         conn.close()
 
@@ -77,8 +77,6 @@ def test_insert_and_count(tmp_config):
 
 
 def test_relative_claim_keeps_ratio_and_baseline(tmp_config):
-    """The core schema rule: a relative claim stores the ratio + baseline ref,
-    never a reconstructed absolute."""
     store.init_db(tmp_config)
     conn = store.connect(tmp_config.paths.db_path)
     try:
@@ -103,6 +101,6 @@ def test_relative_claim_keeps_ratio_and_baseline(tmp_config):
         ).fetchone()
         assert row["cmp_is_relative"] == 1
         assert row["cmp_baseline_entity"] == "base"
-        assert row["value"] == 1.15 and row["unit"] == "x"  # stayed a ratio, not absolutized
+        assert row["value"] == 1.15 and row["unit"] == "x"
     finally:
         conn.close()

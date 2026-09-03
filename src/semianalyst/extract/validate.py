@@ -30,6 +30,11 @@ grounded `ExtractionResult`, enforcing the schema's integrity rules in code:
                    the surviving entity.
                    The canonical `name` is always pinned into `aliases` — it is a
                    surface form of the entity, and models repeat it inconsistently.
+  8. Kind        — `source_record_kind` is ingest-attested (sidecar / CNA-vs-CPE
+                   parser), never model-emitted. A proposal that self-attests
+                   ghsa_reviewed / nvd_cna / cisa_kev has that field stripped
+                   here; persist stamps the ingest kind. Yaml ranking must not
+                   treat a researcher_writeup's self-attest as high-weight.
 
 Rejections carry only a kind, a model-supplied identifier/path (sanitized before
 logging), and a fixed reason string — never raw model text values, which under
@@ -64,27 +69,20 @@ class ExtractionError(Exception):
 
 
 class ExtractionResult(BaseModel):
-    """What an Extractor returns for one document (matches the golden fixture)."""
-
     entities: list[models.Entity] = []
     claims: list[models.Claim] = []
 
 
 @dataclass(frozen=True)
 class Rejection:
-    kind: str      # "claim" | "claim_condition" | "entity" | "entity_alias" |
-                   #   "entity_attribute" | "entity_merge"
-    target: str    # id / path (model-supplied) — sanitized before logging
+    kind: str
+    target: str
     reason: str
 
 
-# --------------------------------------------------------------------------
-# Normalization tables
-# --------------------------------------------------------------------------
-RATIO_UNITS = {"x", "X", "×"}                 # pure ratios — inherently comparative
-RELATIVE_OK_UNITS = RATIO_UNITS | {"%"}       # a relative claim may be a ratio or a percent
+RATIO_UNITS = {"x", "X", "×"}
+RELATIVE_OK_UNITS = RATIO_UNITS | {"%"}
 
-# (factor, canonical_unit) — bandwidth->GB/s, power->W. Extend as real docs need.
 _UNIT_CONV: dict[str, tuple[float, str]] = {
     "TB/s": (1000.0, "GB/s"), "GB/s": (1.0, "GB/s"), "MB/s": (0.001, "GB/s"),
     "kW": (1000.0, "W"), "W": (1.0, "W"), "mW": (0.001, "W"),
@@ -97,43 +95,31 @@ _MONTHS = {
 }
 _MONTHS.update({name[:3]: num for name, num in dict(_MONTHS).items()})
 
-# Node/chip attributes that must be grounded when non-null. hvm_date_actual is
-# exempt (backfilled, not extracted); process_node_ref is a structural join key.
 GROUNDABLE: dict[str, list[str]] = {
     "node": ["density_mtx_mm2", "transistor_type", "backside_power", "hvm_date_claimed"],
     "chip": ["transistor_count_b", "die_size_mm2", "package_type", "memory_type",
              "memory_bw_gbps", "tdp_w", "launch_date"],
+    "package": ["ecosystem", "name", "purl", "cpe"],
+    "product": ["ecosystem", "name", "purl", "cpe"],
+    "cve": ["cwe"],
 }
-_VALID_PATHS = {f"{sub}.{f}" for sub, fields in GROUNDABLE.items() for f in fields}
+# v5 identity citation slots — optional; presence-grounding remains the floor
+IDENTITY_CITE_PATHS = {"vendor", "name", "entity_type", "cve.cve_id"}
+_VALID_PATHS = {f"{sub}.{f}" for sub, fields in GROUNDABLE.items() for f in fields} | IDENTITY_CITE_PATHS
 
-_CTRL = re.compile(CTRL_CLASS)  # shared CLASS, local scrub semantics (textnorm)
-
-# Sparse-benchmark vocabulary (v1, 2026-08-18 gate — injection F1, a live bug):
-# conditions.sparsity is model-proposed, and a hostile document can steer the
-# model to omit or deny the disclosure. The quote_span is already grounded, so
-# its own vocabulary overrides the model's self-declaration — presence of any
-# term force-sets sparsity=True. Fails toward suspect, never toward clean (the
-# same fail-safe direction as location_type). `2:4` is the structured-sparsity
-# ratio notation; \b keeps it from matching inside clock times like "12:45".
+_CTRL = re.compile(CTRL_CLASS)
 _SPARSE_VOCAB_V1 = re.compile(r"(?i)\b(spars\w*|prun\w*|2:4)\b")
 
 
 def _safe(text: str) -> str:
-    """Sanitize a model-controlled id/path before it enters a log line."""
     return _CTRL.sub(" ", text)[:120]
 
 
 def _grounded_ci(text: str, source_text: str) -> bool:
-    """Case-insensitive `is_grounded` — for identity SURFACE FORMS only (name,
-    vendor, aliases), whose casing varies legitimately ("TSMC"/"Tsmc", same as
-    the dedup key). Quote spans stay case-sensitive: they claim to be verbatim
-    quotes; identity presence is an existence floor, not a quote."""
     return is_grounded(text.casefold(), source_text.casefold())
 
 
 def normalize_date_str(value: str) -> str:
-    """ISO passes through; month-precision -> first-of-month; year -> first-of-year.
-    Anything unrecognized is returned unchanged (pydantic rejects it downstream)."""
     s = value.strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
         return s
@@ -171,7 +157,6 @@ def _pre_normalize(proposal: dict) -> dict:
 
 
 def _force_unknown(citation: models.Citation) -> None:
-    # Flat text can't distinguish body/table/footnote — fail safe (never `body`).
     citation.location_type = models.LocationType.unknown
 
 
@@ -181,9 +166,6 @@ def validate_proposal(
     normalized = _pre_normalize(proposal)
     rejections: list[Rejection] = []
 
-    # Per-item shape validation: a single malformed field drops THAT item (with a
-    # rejection), never the whole extraction. Real models occasionally emit an
-    # off-type value (e.g. sparsity "enabled" instead of true).
     entities: list[models.Entity] = []
     for raw_entity in normalized.get("entities", []):
         try:
@@ -194,24 +176,28 @@ def validate_proposal(
                                         f"shape invalid at {[e['loc'] for e in exc.errors()]}"))
     claims: list[models.Claim] = []
     for raw_claim in normalized.get("claims", []):
+        # source_record_kind is ingest-attested. Strip it before pydantic so a
+        # hostile proposal cannot self-attest ghsa_reviewed / nvd_cna / cisa_kev.
+        emitted_kind = None
+        if isinstance(raw_claim, dict) and "source_record_kind" in raw_claim:
+            emitted_kind = raw_claim.pop("source_record_kind")
         try:
-            claims.append(models.Claim.model_validate(raw_claim))
+            claim = models.Claim.model_validate(raw_claim)
         except ValidationError as exc:
             cid = raw_claim.get("claim_id", "?") if isinstance(raw_claim, dict) else "?"
             rejections.append(Rejection("claim", str(cid),
                                         f"shape invalid at {[e['loc'] for e in exc.errors()]}"))
+            continue
+        if emitted_kind is not None:
+            rejections.append(Rejection(
+                "claim_kind", claim.claim_id,
+                "source_record_kind is ingest-attested; model emission stripped",
+            ))
+        claims.append(claim)
 
-    # --- entities: presence-ground identity, ground attributes + aliases, dedup ---
     kept_entities: list[models.Entity] = []
     seen: dict[tuple[str, str], models.Entity] = {}
     for ent in entities:
-        # Identity presence-grounding (2026-08-18 gate — the "identity citation
-        # slots" residual): name/vendor have no attribute_citations home, so a
-        # hostile proposal could otherwise mint an entity for a vendor the
-        # document never mentions (the first-hostile-writer identity plant).
-        # Presence in the source text is the cheap floor — full citation slots
-        # are deferred to schema v5. Fail-soft: drops THIS entity (its claims
-        # cascade via the kept-entity check below), never the extraction.
         if not _grounded_ci(ent.name, source_text):
             rejections.append(Rejection("entity", ent.entity_id,
                                         "name not found in source"))
@@ -220,12 +206,10 @@ def validate_proposal(
             rejections.append(Rejection("entity", ent.entity_id,
                                         "vendor not found in source"))
             continue
-        # G1 — alias grounding (2026-08-18 gate): every model-proposed alias
-        # must appear in THIS document's text, or a hostile doc could plant a
-        # competitor's product name as an alias and capture its claims at
-        # store-reconciliation time. Runs BEFORE dedup so merged entities union
-        # only grounded aliases. The rejection target is the alias's list index,
-        # never the alias string itself (a rejection carries no raw model text).
+        if ent.cve is not None and not _grounded_ci(ent.cve.cve_id, source_text):
+            rejections.append(Rejection("entity", ent.entity_id,
+                                        "cve_id not found in source"))
+            continue
         kept_aliases: list[str] = []
         for idx, alias in enumerate(ent.aliases):
             if _grounded_ci(alias, source_text):
@@ -234,17 +218,17 @@ def validate_proposal(
                 rejections.append(Rejection("entity_alias", f"{ent.entity_id}:{idx}",
                                             "alias not found in source"))
         ent.aliases = kept_aliases
-        for sub in ("node", "chip"):
+        for sub, fields in GROUNDABLE.items():
             attrs = getattr(ent, sub)
             if attrs is None:
                 continue
-            for field in GROUNDABLE[sub]:
+            for field in fields:
                 if getattr(attrs, field) is None:
                     continue
                 path = f"{sub}.{field}"
                 cite = ent.attribute_citations.get(path)
                 if cite is None or not is_grounded(cite.quote_span, source_text):
-                    setattr(attrs, field, None)  # drop the ungrounded attribute
+                    setattr(attrs, field, None)
                     ent.attribute_citations.pop(path, None)
                     rejections.append(Rejection("entity_attribute", f"{ent.entity_id}:{path}",
                         "missing grounding citation" if cite is None
@@ -257,19 +241,13 @@ def validate_proposal(
             else:
                 _force_unknown(ent.attribute_citations[path])
 
-        # One document's "TSMC"/"Tsmc"/"TSMC " is one vendor, not two entities —
-        # the SHARED fold (textnorm), so dedup, reconcile, and analyze answer
-        # "same value?" identically (precommit gate: three drifting copies had
-        # shipped three different answers).
         key = (fold(ent.vendor), fold(ent.name))
         if key in seen:
             base = seen[key]
             for alias in ent.aliases:
                 if alias not in base.aliases:
                     base.aliases.append(alias)
-            # Reconcile node/chip attribute VALUES (grounded by now), not just
-            # citations — otherwise a merged citation can point at a null value.
-            for sub in ("node", "chip"):
+            for sub, fields in GROUNDABLE.items():
                 dup_attrs = getattr(ent, sub)
                 if dup_attrs is None:
                     continue
@@ -277,7 +255,7 @@ def validate_proposal(
                 if base_attrs is None:
                     setattr(base, sub, dup_attrs)
                 else:
-                    for field in GROUNDABLE[sub]:
+                    for field in fields:
                         if getattr(base_attrs, field) is None and getattr(dup_attrs, field) is not None:
                             setattr(base_attrs, field, getattr(dup_attrs, field))
             for path, cite in ent.attribute_citations.items():
@@ -288,12 +266,6 @@ def validate_proposal(
             seen[key] = ent
             kept_entities.append(ent)
 
-    # The canonical `name` is itself a surface form of the entity: pin it into
-    # aliases so alias-based resolution never depends on whether the model chose
-    # to repeat it there (a judgment call models make inconsistently). Applied to
-    # the surviving entities only, so a merged case-variant dup's name never
-    # injects alias noise. Exempt from G1 by construction: the name is the
-    # shape-validated identity field, already presence-grounded above.
     for ent in kept_entities:
         if ent.name not in ent.aliases:
             ent.aliases.insert(0, ent.name)
@@ -301,11 +273,8 @@ def validate_proposal(
     vendor_of = {e.entity_id: e.vendor for e in kept_entities}
     kept_entity_ids = set(vendor_of)
 
-    # --- claims: provenance, ground, integrity, completeness, fail-safe ---
     kept_claims: list[models.Claim] = []
     for claim in claims:
-        # A claim must be about an entity extracted from THIS document. A hostile
-        # doc can otherwise name a real competitor's entity_id to attach a claim.
         if claim.entity_id not in kept_entity_ids:
             rejections.append(Rejection("claim", claim.claim_id,
                                         "references an entity absent from this document's proposal"))
@@ -314,36 +283,22 @@ def validate_proposal(
             rejections.append(Rejection("claim", claim.claim_id,
                                         "quote_span not found in source"))
             continue
-        # Sparse-benchmark vocabulary in the (now grounded) quote_span force-sets
-        # sparsity=True — the self-declaration is not trusted in the non-suspect
-        # direction. Must run before the marketing_only check below, which reads it.
         if claim.conditions.sparsity is not True and _SPARSE_VOCAB_V1.search(claim.citation.quote_span):
             claim.conditions.sparsity = True
             rejections.append(Rejection("claim_condition", claim.claim_id,
                                         "sparsity forced true: sparse-benchmark vocabulary in quote_span"))
-        # A relative claim must express relative magnitude (ratio or percent),
-        # never an absolute measurement unit.
-        if claim.comparison.is_relative and claim.unit not in RELATIVE_OK_UNITS:
+        if (claim.unit is not None and claim.comparison.is_relative
+                and claim.unit not in RELATIVE_OK_UNITS):
             rejections.append(Rejection("claim", claim.claim_id,
                                         "relative claim carries a non-ratio/percent (absolutized) unit"))
             continue
-        # A pure ratio unit (x) is inherently comparative — is_relative must be set.
-        # (% is intentionally excluded: an absolute rate like a 65% yield is valid.)
-        if claim.unit in RATIO_UNITS and not claim.comparison.is_relative:
+        if claim.unit is not None and claim.unit in RATIO_UNITS and not claim.comparison.is_relative:
             rejections.append(Rejection("claim", claim.claim_id,
                                         "ratio unit but is_relative not set (undeclared relativity)"))
             continue
-        # Don't trust the model's completeness label: a relative claim with no
-        # baseline is missing_baseline regardless of what the model reported.
         if (claim.comparison.is_relative and claim.comparison.baseline_entity is None
                 and claim.completeness == models.Completeness.complete):
             claim.completeness = models.Completeness.missing_baseline
-        # marketing_only: sparsity + a genuine CROSS-VENDOR (competitor) comparison.
-        # BOTH vendors must be known — an unresolved (None) baseline vendor is NOT
-        # treated as "different vendor" (that misfired on same-vendor claims whose
-        # baseline wasn't in the proposal, e.g. a vendor slide citing N2-vs-N3E
-        # without declaring N3E). Sparsity suspicion for same-vendor comparisons is
-        # an analyze-layer signal, not a completeness label.
         entity_vendor = vendor_of.get(claim.entity_id)
         baseline_vendor = vendor_of.get(claim.comparison.baseline_entity)
         if (claim.conditions.sparsity is True
@@ -359,7 +314,6 @@ def validate_proposal(
 
 
 def build_result(proposal: dict, source_text: str) -> ExtractionResult:
-    """Validate + normalize a proposal, logging (not raising on) per-item rejections."""
     result, rejections = validate_proposal(proposal, source_text)
     for rej in rejections:
         logger.warning("validate %s [%s]: %s", rej.kind, _safe(rej.target), rej.reason)

@@ -7,6 +7,13 @@ fill-null with never-overwrite, refusals persisted as Conflict records — see
 db.reconcile_entity), and inserts each claim under a document-scoped claim_id so
 two documents' claims about the same entity+metric don't collide.
 
+Document identity is `doc_id`, never `url`. Schema has no UNIQUE(url): NVD CNA
+and NVD CPE are two documents even when they share a URL (GEI-6). Looking up
+an existing row by URL would collapse them.
+
+`source_record_kind` is ingest-attested. Pass it here (sidecar / CNA-vs-CPE
+parser) to stamp advisory claims; the LLM proposal is not a source of kind.
+
 Remaining cross-document trust decisions (tier precedence beyond never-overwrite,
 status-level tier floors) stay with analyze / later workstreams. See CLAUDE.md.
 """
@@ -16,6 +23,7 @@ from __future__ import annotations
 import sqlite3
 
 from . import models
+from .attestation import stamp_advisory_claims
 from .db import insert_claim, insert_document, reconcile_entity
 
 
@@ -30,6 +38,8 @@ def persist_extraction(
     document: models.Document,
     entities: list[models.Entity],
     claims: list[models.Claim],
+    *,
+    source_record_kind: models.SourceRecordKind | str | None = None,
 ) -> None:
     """Fold one document's validated extraction into the store.
 
@@ -41,10 +51,15 @@ def persist_extraction(
     superseded documents disappear with them. That is correct semantics: the
     conflict table describes the CURRENT fold, not an audit log of every write
     ever attempted (the quarantined artifact remains the durable record).
+
+    When `source_record_kind` is provided it is the ingest attestation and is
+    stamped onto advisory claims, overwriting any leftover model value.
     """
-    insert_document(conn, document)  # fail-loud on duplicate doc_id
+    insert_document(conn, document)  # fail-loud on duplicate doc_id; URL is not a key
     for entity in entities:
         reconcile_entity(conn, entity, document.doc_id)
+    if source_record_kind is not None:
+        claims = stamp_advisory_claims(claims, source_record_kind)
     for claim in claims:
         scoped = claim.model_copy(update={"claim_id": _scope(document.doc_id, claim.claim_id)})
         insert_claim(conn, scoped)

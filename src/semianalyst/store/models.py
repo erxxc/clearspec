@@ -1,22 +1,11 @@
-"""Canonical pydantic models — generated from schema/extraction_schema_v4.yaml
-(v2 nested shape + v3 derived corroboration + v4 content bounds & Conflict).
+"""Canonical pydantic models — v4 foundry pack + v5 advisory pack (GEI-7).
 
-These mirror the schema's *nested* shape (claim.comparison, claim.conditions,
-entity.node, entity.chip, entity.attribute_citations, ...). The relational
-storage layer (db.py) flattens them into columns; keeping the models nested
-keeps the schema's semantics legible and confines SQL knowledge to the store.
+v4 yaml is unedited. v5 (schema/extraction_schema_v5.yaml) adds advisory
+entity/claim types, structured version intervals, and claim-level
+source_record_kind. Foundry enums and node/chip attributes remain legal so
+the v4 path does not break.
 
-Design invariants carried from the schema (see CLAUDE.md):
-  - The claim is the atomic unit.
-  - Relative claims keep the ratio + baseline ref; they are NEVER absolutized.
-  - Every claim value AND every non-null entity attribute cites a source span
-    (Citation / attribute_citations) — grounding is code-enforced (v2).
-  - source_tier is set at the document level and inherited by claims.
-  - v4 content bounds: every model- or network-influenced string is length- and
-    charset-bounded here (the shape guard); migration 0004 mirrors the LENGTH
-    bounds as SQLite CHECKs (the durable flood guard). Verbatim source text
-    (quote_span, stated_caveats) is length-bounded only — it may legitimately
-    contain newlines the no-control-chars pattern would reject.
+Never auto-resolve: no model helper picks a winning source_record_kind.
 """
 
 from __future__ import annotations
@@ -25,42 +14,69 @@ import datetime as dt
 import enum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_serializer, model_validator
 
 # --------------------------------------------------------------------------
-# v4 bounded string types (schema `bounds` block). _NO_CTRL rejects C0/DEL —
-# terminal-escape bytes never enter the store, independent of display sanitizing.
+# v4 bounded string types (schema `bounds` block). _NO_CTRL rejects C0/DEL.
 # --------------------------------------------------------------------------
 _NO_CTRL = r"^[^\x00-\x1f\x7f]*$"
 SlugId80 = Annotated[str, StringConstraints(pattern=r"^[a-z0-9_]{1,80}$")]
 DocId120 = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")]
 ClaimId200 = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")]
 Sha256Hex = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
+CveId = Annotated[str, StringConstraints(pattern=r"^CVE-[0-9]{4}-[0-9]{4,}$", max_length=32)]
+CweId = Annotated[str, StringConstraints(pattern=r"^CWE-[0-9]{1,8}$", max_length=32)]
 Text16 = Annotated[str, StringConstraints(max_length=16, pattern=_NO_CTRL)]
+Text32 = Annotated[str, StringConstraints(max_length=32, pattern=_NO_CTRL)]
+Text40 = Annotated[str, StringConstraints(max_length=40, pattern=_NO_CTRL)]
 Text80 = Annotated[str, StringConstraints(max_length=80, pattern=_NO_CTRL)]
 Text120 = Annotated[str, StringConstraints(max_length=120, pattern=_NO_CTRL)]
 Text200 = Annotated[str, StringConstraints(max_length=200, pattern=_NO_CTRL)]
+Text256 = Annotated[str, StringConstraints(max_length=256, pattern=_NO_CTRL)]
 Text300 = Annotated[str, StringConstraints(max_length=300, pattern=_NO_CTRL)]
+Text512 = Annotated[str, StringConstraints(max_length=512, pattern=_NO_CTRL)]
 Text2000 = Annotated[str, StringConstraints(max_length=2000, pattern=_NO_CTRL)]
-Span2000 = Annotated[str, StringConstraints(max_length=2000)]   # verbatim source text
-Caveat500 = Annotated[str, StringConstraints(max_length=500)]   # verbatim footnotes
+Span2000 = Annotated[str, StringConstraints(max_length=2000)]
+Caveat500 = Annotated[str, StringConstraints(max_length=500)]
 
 
-# --------------------------------------------------------------------------
-# Enums
-# --------------------------------------------------------------------------
 class DocType(str, enum.Enum):
     foundry_announcement = "foundry_announcement"
     conference_paper = "conference_paper"
     vendor_whitepaper = "vendor_whitepaper"
     product_brief = "product_brief"
+    # v5 advisory pack
+    nvd_record = "nvd_record"
+    ghsa = "ghsa"
+    vendor_advisory = "vendor_advisory"
+    cisa_kev = "cisa_kev"
+    researcher_writeup = "researcher_writeup"
 
 
 class SourceTier(enum.IntEnum):
-    # conf=1, foundry=2, vendor=3 — lower tier == higher trust.
+    # foundry document-level 1/2/3 — NOT the advisory claim-class rank
     conference = 1
     foundry = 2
     vendor = 3
+
+
+class SourceRecordKind(str, enum.Enum):
+    """Claim-level source identity (v5). Distinguishes NVD CNA from NVD CPE
+    even when they share a URL. Ranking is documented in the yaml and is
+    NEVER applied as a resolver."""
+    nvd_cna = "nvd_cna"
+    nvd_cpe = "nvd_cpe"
+    nvd_catalog = "nvd_catalog"
+    ghsa_reviewed = "ghsa_reviewed"
+    ghsa_unreviewed = "ghsa_unreviewed"
+    vendor_json = "vendor_json"
+    vendor_cna = "vendor_cna"
+    vendor_acknowledgement = "vendor_acknowledgement"
+    vendor_cvss = "vendor_cvss"
+    cisa_kev = "cisa_kev"
+    nvd_exploit_field = "nvd_exploit_field"
+    ghsa_exploit_field = "ghsa_exploit_field"
+    peer_research = "peer_research"
 
 
 class ReviewStatus(str, enum.Enum):
@@ -73,8 +89,11 @@ class EntityType(str, enum.Enum):
     process_node = "process_node"
     chip = "chip"
     chiplet = "chiplet"
-    package = "package"
+    package = "package"          # foundry: semiconductor package; advisory: software package
     ip_block = "ip_block"
+    cve = "cve"
+    product = "product"
+    advisory = "advisory"
 
 
 class TransistorType(str, enum.Enum):
@@ -91,6 +110,22 @@ class ClaimClass(str, enum.Enum):
     yield_ = "yield"
     cost = "cost"
     availability = "availability"
+    affected_range = "affected_range"
+    patched_in = "patched_in"
+    cvss = "cvss"
+    exploit_status = "exploit_status"
+    workaround = "workaround"
+
+
+FOUNDRY_CLAIM_CLASSES = frozenset({
+    ClaimClass.performance, ClaimClass.efficiency, ClaimClass.density,
+    ClaimClass.power, ClaimClass.yield_, ClaimClass.cost, ClaimClass.availability,
+})
+ADVISORY_CLAIM_CLASSES = frozenset({
+    ClaimClass.affected_range, ClaimClass.patched_in, ClaimClass.cvss,
+    ClaimClass.exploit_status, ClaimClass.workaround,
+})
+RANGE_CLAIM_CLASSES = frozenset({ClaimClass.affected_range, ClaimClass.patched_in})
 
 
 class Completeness(str, enum.Enum):
@@ -98,35 +133,37 @@ class Completeness(str, enum.Enum):
     missing_baseline = "missing_baseline"
     missing_conditions = "missing_conditions"
     marketing_only = "marketing_only"
+    missing_range = "missing_range"
+    missing_product = "missing_product"
 
 
 class LocationType(str, enum.Enum):
     body = "body"
     table = "table"
     figure = "figure"
-    footnote = "footnote"     # footnote-sourced claims deserve suspicion
-    unknown = "unknown"       # v2: location undetermined (flat text) — fail-safe
+    footnote = "footnote"
+    unknown = "unknown"
 
 
 class CorroborationStatus(str, enum.Enum):
     uncorroborated = "uncorroborated"
     corroborated = "corroborated"
-    weakly_corroborated = "weakly_corroborated"  # v3: >=2 agree within tolerance, <2 non-suspect
+    weakly_corroborated = "weakly_corroborated"
     contradicted = "contradicted"
 
 
-# --------------------------------------------------------------------------
-# CITATION — a grounded source span. Reused by claims AND entity attributes (v2).
-# --------------------------------------------------------------------------
+class ExploitStatus(str, enum.Enum):
+    known_exploited = "known_exploited"
+    no_known_exploit = "no_known_exploit"
+    disputed = "disputed"
+
+
 class Citation(BaseModel):
     page: int | None = None
-    quote_span: Span2000             # exact source text supporting the value
+    quote_span: Span2000
     location_type: LocationType
 
 
-# --------------------------------------------------------------------------
-# DOCUMENT
-# --------------------------------------------------------------------------
 class Document(BaseModel):
     model_config = ConfigDict(use_enum_values=False)
 
@@ -143,23 +180,16 @@ class Document(BaseModel):
     review_status: ReviewStatus = ReviewStatus.unreviewed
 
 
-# --------------------------------------------------------------------------
-# ENTITY (with node / chip sub-attributes + per-attribute grounding)
-# --------------------------------------------------------------------------
 class NodeAttributes(BaseModel):
     density_mtx_mm2: float | None = None
     transistor_type: TransistorType | None = None
     backside_power: bool | None = None
     hvm_date_claimed: dt.date | None = None
-    hvm_date_actual: dt.date | None = None  # backfilled later — slip tracking
+    hvm_date_actual: dt.date | None = None
 
 
 class ChipAttributes(BaseModel):
-    # v4 bounds apply here too — package_type/memory_type/process_node_ref were
-    # the one set of model-influenced strings the first bounds pass missed
-    # (appsec finding, 2026-08-18): unbounded, they let control bytes into the
-    # store AND crashed conflict recording against Conflict's Text120 pattern.
-    process_node_ref: SlugId80 | None = None  # FK to the node entity — the join key
+    process_node_ref: SlugId80 | None = None
     transistor_count_b: float | None = None
     die_size_mm2: float | None = None
     package_type: Text120 | None = None
@@ -167,6 +197,27 @@ class ChipAttributes(BaseModel):
     memory_bw_gbps: float | None = None
     tdp_w: float | None = None
     launch_date: dt.date | None = None
+
+
+class PackageAttributes(BaseModel):
+    """Software-package attrs (v5). All citation-grounded when non-null."""
+    ecosystem: Text80
+    name: Text80
+    purl: Text512 | None = None
+    cpe: Text256 | None = None
+
+
+class ProductAttributes(BaseModel):
+    """Product attrs (v5). ecosystem nullable (OpenSSH / PAN-OS have no eco)."""
+    name: Text80
+    ecosystem: Text80 | None = None
+    purl: Text512 | None = None
+    cpe: Text256 | None = None
+
+
+class CveAttributes(BaseModel):
+    cve_id: CveId
+    cwe: CweId | None = None
 
 
 class Entity(BaseModel):
@@ -177,38 +228,67 @@ class Entity(BaseModel):
     aliases: list[Text80] = Field(default=[], max_length=16)
     node: NodeAttributes | None = None
     chip: ChipAttributes | None = None
-    # v2: attribute-path -> Citation. Every non-null node/chip attribute (except
-    # hvm_date_actual, which is backfilled) must have a grounded citation here.
+    package: PackageAttributes | None = None
+    product: ProductAttributes | None = None
+    cve: CveAttributes | None = None
     attribute_citations: dict[str, Citation] = {}
 
+    @model_serializer(mode="wrap")
+    def _omit_null_v5_attrs(self, handler):
+        data = handler(self)
+        for key in ("package", "product", "cve"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
-# --------------------------------------------------------------------------
-# CLAIM (the atomic unit)
-# --------------------------------------------------------------------------
+    @model_validator(mode="after")
+    def _advisory_identity(self) -> "Entity":
+        if self.entity_type == EntityType.cve and self.cve is None:
+            raise ValueError("cve entities require cve.cve_id (identity)")
+        if self.entity_type == EntityType.product and self.product is None:
+            raise ValueError("product entities require product attributes")
+        return self
+
+
 class Comparison(BaseModel):
     is_relative: bool = False
-    baseline_entity: SlugId80 | None = None  # what it's compared AGAINST
-    baseline_stated: bool = False       # did the doc actually name the baseline?
+    baseline_entity: SlugId80 | None = None
+    baseline_stated: bool = False
 
 
 class Conditions(BaseModel):
     workload: Text120 | None = None
-    precision: Text120 | None = None    # FP4/FP8/FP16/INT8 — critical for AI claims
-    sparsity: bool | None = None        # the classic 2x inflation lever
+    precision: Text120 | None = None
+    sparsity: bool | None = None
     thermal_config: Text120 | None = None
-    stated_caveats: list[Caveat500] = Field(default=[], max_length=16)  # verbatim footnote text
+    stated_caveats: list[Caveat500] = Field(default=[], max_length=16)
 
 
 class Corroboration(BaseModel):
-    # DERIVED, NOT PERSISTED (v3 / decision B2). The corroboration verdict is a
-    # per-GROUP fact analyze computes derive-on-read (see analyze/corroborate.py →
-    # AnalysisReport); it is NOT stored on the claim row. This field carries a
-    # neutral default on the in-memory claim so extraction output has a stable
-    # shape, but `store.insert_claim` never writes it and no row-to-claim reader
-    # reads it back. Do not add a persisted per-row verdict without settling the
-    # per-group-fact-in-a-per-row-home question (CLAUDE.md, analyze resolution).
     status: CorroborationStatus = CorroborationStatus.uncorroborated
     related_claim_ids: list[str] = []
+
+
+class VersionBound(BaseModel):
+    """One end of a structured version interval. quote_span is NOT this."""
+    version: Text80
+    inclusive: bool
+
+
+class VersionInterval(BaseModel):
+    start: VersionBound | None = None  # None = unbounded below
+    end: VersionBound | None = None    # None = unbounded above
+
+    @model_validator(mode="after")
+    def _not_empty(self) -> "VersionInterval":
+        if self.start is None and self.end is None:
+            raise ValueError("version interval must have a start and/or end bound")
+        return self
+
+
+class VersionRange(BaseModel):
+    """A set of structured intervals. Not a display string."""
+    intervals: list[VersionInterval] = Field(min_length=1, max_length=32)
 
 
 class Claim(BaseModel):
@@ -217,49 +297,89 @@ class Claim(BaseModel):
     entity_id: SlugId80
     claim_class: ClaimClass
     metric: Text120
-    value: float
-    unit: Text16
+    value: float | None = None
+    unit: Text16 | None = None
     comparison: Comparison = Comparison()
     conditions: Conditions = Conditions()
     completeness: Completeness
     citation: Citation
     corroboration: Corroboration = Corroboration()
+    # v5 advisory fields
+    cve_id: CveId | None = None
+    version_range: VersionRange | None = None
+    exploit_status: ExploitStatus | None = None
+    workaround_text: Caveat500 | None = None
+    # Ingest-attested (sidecar / CNA-vs-CPE parser), never model-emitted.
+    # validate.py strips proposal values; SQL CHECK requires it for advisory
+    # classes at persist. Pydantic does not require it — the model must not
+    # be the source of this field.
+    source_record_kind: SourceRecordKind | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_null_v5_fields(self, handler):
+        data = handler(self)
+        for key in ("cve_id", "version_range", "exploit_status",
+                    "workaround_text", "source_record_kind"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
+
+    @model_validator(mode="after")
+    def _payload_matches_class(self) -> "Claim":
+        cls = self.claim_class
+        if cls in FOUNDRY_CLAIM_CLASSES:
+            if self.value is None or self.unit is None:
+                raise ValueError("foundry claims require numeric value and unit")
+            if self.version_range is not None:
+                raise ValueError("foundry claims do not carry version_range")
+            return self
+        if cls in RANGE_CLAIM_CLASSES:
+            if self.version_range is None:
+                raise ValueError(
+                    "affected_range/patched_in require a structured version_range; "
+                    "quote_span is the verbatim string, not the stored range"
+                )
+            return self
+        if cls == ClaimClass.cvss:
+            if self.value is None:
+                raise ValueError("cvss claims require a numeric value")
+            return self
+        if cls == ClaimClass.exploit_status:
+            if self.exploit_status is None:
+                raise ValueError("exploit_status claims require exploit_status")
+            return self
+        if cls == ClaimClass.workaround:
+            if self.workaround_text is None:
+                raise ValueError("workaround claims require workaround_text")
+            return self
+        return self
+
+    def advisory_group_key(self) -> tuple[str, str, str]:
+        """Represent the GEI-9 grouping key. Does not compare or resolve."""
+        return (self.cve_id or "", self.entity_id, self.claim_class.value)
 
 
-# --------------------------------------------------------------------------
-# CONFLICT (v4) — persisted reconciliation-refusal record.
-# --------------------------------------------------------------------------
 class ConflictKind(str, enum.Enum):
-    identity_field = "identity_field"    # later doc differs on frozen vendor/name/entity_type
-    attribute = "attribute"              # later doc differs on a non-null node/chip attribute (K1/K2)
-    alias_collision = "alias_collision"  # incoming alias equals another entity's name/alias (G3)
-    alias_overflow = "alias_overflow"    # union would exceed the per-entity alias ceiling (v4 bounds)
+    identity_field = "identity_field"
+    attribute = "attribute"
+    alias_collision = "alias_collision"
+    alias_overflow = "alias_overflow"
 
 
 class Conflict(BaseModel):
-    """What a later document tried to write and the store refused to apply
-    (never-overwrite is universal). Persisted because the offered value has no
-    other home — reconcile drops it at refusal time (2026-08-18 gate, Conflict 1).
-    offered_value/stored_value are ADVERSARY-AUTHORED text meant for a human
-    reader: bounded here and in DDL, and every display site must route them
-    through the hardened sanitizer (ANSI/OSC + Unicode Cf)."""
-
-    conflict_id: int | None = None       # assigned by the store on insert
+    conflict_id: int | None = None
     kind: ConflictKind
     entity_id: SlugId80
-    doc_id: DocId120                     # the offending document
-    field: Text80                        # identity field name, attribute path, or 'alias'
-    stored_value: Text120 | None = None  # null for alias_collision
+    doc_id: DocId120
+    field: Text80
+    stored_value: Text120 | None = None
     offered_value: Text120
-    created_at: str                      # ISO timestamp, store-stamped
+    created_at: str
 
 
-# --------------------------------------------------------------------------
-# MACRO_SNAPSHOT (Phase 2 — thin EDGAR layer)
-# --------------------------------------------------------------------------
 class MacroSnapshot(BaseModel):
     vendor: str
-    period: str                      # e.g. FY2026-Q2
+    period: str
     capex_usd_m: float | None = None
     segment_revenue: dict[str, float] = {}
     inventory_days: float | None = None
