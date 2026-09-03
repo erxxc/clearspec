@@ -237,7 +237,12 @@ def _assess_advisory(group: list[ClaimView], entity_ids: set[str]) -> Assessment
 
     if claim_class in _RANGE_CLASSES:
         set_relation = _pairwise_set_relation(members)
-        if set_relation is None:
+        missing = len(members) >= 2 and any(c.version_range is None for c in members)
+        if missing:
+            # SQL CHECK blocks persist; ClaimView can still omit a range.
+            agree = False
+            flags.append("missing_version_range")
+        elif set_relation is None:
             agree = True  # single ranged claim or no ranges
         else:
             agree = set_relation == "equal"
@@ -321,9 +326,13 @@ def analyze_claims(
 
     for claim in claims:
         if claim.claim_class in _ADVISORY_CLASSES:
-            # (cve_id, package_or_product, claim_class) — entity_id is the package/product
-            key = claim.advisory_group_key()
-            advisory_groups[key].append(claim)
+            # (cve_id, package_or_product, claim_class) — entity_id is the package/product.
+            # Empty cve_id is not a grouping key: refuse collapsing those claims.
+            cve = (claim.cve_id or "").strip()
+            if not cve:
+                advisory_groups[("", claim.entity_id, claim.claim_class, claim.claim_id)].append(claim)
+            else:
+                advisory_groups[claim.advisory_group_key()].append(claim)
         else:
             foundry_groups[(
                 claim.entity_id, _norm_key(claim.metric), claim.is_relative,
