@@ -13,6 +13,10 @@ grounded `ExtractionResult`, enforcing the schema's integrity rules in code:
                    appears in the source is dropped, and an ungrounded alias is
                    dropped from its list (G1) — both case-insensitive presence
                    floors (existence, not verbatim-quote proof).
+                   Version-range bounds: every version_bound.version string must
+                   appear in the claim quote_span and/or source text (is_grounded
+                   style). Inferring exclusive+1 (1.1.12 from "1.1.11 and earlier")
+                   is rejected, not persisted.
   4. Provenance  — a claim must be about an entity extracted from THIS document
                    (claim.entity_id present in the proposal), else it's dropped.
   5. Integrity   — a relative claim must use a ratio/percent unit (never an
@@ -156,6 +160,11 @@ def _pre_normalize(proposal: dict) -> dict:
     return p
 
 
+def _version_bound_grounded(version: str, quote_span: str, source_text: str) -> bool:
+    """True iff bound.version appears in quote_span and/or source (is_grounded)."""
+    return is_grounded(version, quote_span) or is_grounded(version, source_text)
+
+
 def _force_unknown(citation: models.Citation) -> None:
     citation.location_type = models.LocationType.unknown
 
@@ -283,6 +292,24 @@ def validate_proposal(
             rejections.append(Rejection("claim", claim.claim_id,
                                         "quote_span not found in source"))
             continue
+        if claim.version_range is not None:
+            quote = claim.citation.quote_span
+            bound_ok = True
+            for interval in claim.version_range.intervals:
+                for bound in (interval.start, interval.end):
+                    if bound is None:
+                        continue
+                    if not _version_bound_grounded(bound.version, quote, source_text):
+                        bound_ok = False
+                        break
+                if not bound_ok:
+                    break
+            if not bound_ok:
+                rejections.append(Rejection(
+                    "claim", claim.claim_id,
+                    "version_bound.version not found in quote_span or source",
+                ))
+                continue
         if claim.conditions.sparsity is not True and _SPARSE_VOCAB_V1.search(claim.citation.quote_span):
             claim.conditions.sparsity = True
             rejections.append(Rejection("claim_condition", claim.claim_id,
