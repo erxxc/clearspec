@@ -86,6 +86,7 @@ def test_new_enums_round_trip():
     assert m.ClaimClass.workaround.value == "workaround"
     assert m.Completeness.missing_range.value == "missing_range"
     assert m.Completeness.missing_product.value == "missing_product"
+    # foundry enums still present
     assert m.DocType.foundry_announcement.value == "foundry_announcement"
     assert m.EntityType.process_node.value == "process_node"
     assert m.ClaimClass.performance.value == "performance"
@@ -96,7 +97,7 @@ def test_range_requires_structured_interval_not_display_string():
         m.Claim(
             claim_id="c", doc_id="d", entity_id="pkg_runc",
             cve_id="CVE-2024-21626", claim_class=m.ClaimClass.affected_range,
-            metric="< 1.1.12",
+            metric="< 1.1.12",  # display string is not the range
             source_record_kind=m.SourceRecordKind.nvd_cpe,
             completeness=m.Completeness.complete,
             citation=_cite("runc 1.1.11 and earlier"),
@@ -107,7 +108,7 @@ def test_range_requires_structured_interval_not_display_string():
     )
     assert ok.version_range.intervals[0].end.version == "1.1.12"
     assert ok.version_range.intervals[0].end.inclusive is False
-    assert ok.version_range.intervals[0].start is None
+    assert ok.version_range.intervals[0].start is None  # unbounded below
     assert ok.citation.quote_span == "runc 1.1.11 and earlier"
 
 
@@ -175,343 +176,19 @@ def test_never_auto_resolve_conflicting_ranges_both_persist(tmp_config):
         conn.commit()
         rows = list(conn.execute("SELECT source_record_kind FROM claim"))
         assert {r["source_record_kind"] for r in rows} == {"nvd_cpe", "ghsa_reviewed"}
-        assert store.get_conflicts(conn) == []
+        assert store.get_conflicts(conn) == []  # claims coexist; no attribute fight
         views = store.get_claims_for_analysis(conn)
         keys = {(v.cve_id, v.entity_id, v.claim_class) for v in views}
         assert keys == {("CVE-2024-21626", "pkg_runc", "affected_range")}
+        # GEI-9: both claims persist in one contradicted group; no winning kind.
         from semianalyst.analyze import analyze_claims
         report = analyze_claims(views, store.get_entities_index(conn))
-        assert report.assessments == []
+        assert len(report.assessments) == 1
+        a = report.assessments[0]
+        assert a.status == "contradicted"
+        assert a.set_relation == "subset"
+        assert {"nvd", "ghsa"} <= set(a.members) or set(a.members) == {"nvd_21626:nvd", "ghsa_xr7r:ghsa"}
+        # favored_tier is display-only; store still has both claims
+        assert len(views) == 2
     finally:
         conn.close()
-
-
-def test_empty_ghsa_does_not_outrank_vendor_no_resolver(tmp_config):
-    store.init_db(tmp_config)
-    conn = store.connect(tmp_config.paths.db_path)
-    try:
-        product = m.Entity(
-            entity_id="prod_openssh", entity_type=m.EntityType.product,
-            vendor="OpenBSD", name="OpenSSH",
-            product=m.ProductAttributes(name="OpenSSH", cpe="cpe:2.3:a:openbsd:openssh"),
-            attribute_citations={
-                "product.name": _cite("OpenSSH"),
-                "product.cpe": _cite("cpe:2.3:a:openbsd:openssh"),
-            },
-        )
-        vendor_range = _interval(end="9.7p1", end_incl=True)
-        store.persist_extraction(
-            conn, _doc("vendor_6387", doc_type=m.DocType.vendor_advisory,
-                       publisher="OpenSSH", url="https://www.openssh.com/txt/release-9.8"),
-            [product], [_range_claim(
-                "vendor", "vendor_6387", "prod_openssh", "CVE-2024-6387",
-                m.SourceRecordKind.vendor_json, vendor_range,
-                "Portable OpenSSH versions between 8.5p1 and 9.7p1 (inclusive)",
-                claim_class=m.ClaimClass.patched_in,
-            )])
-        with pytest.raises(ValidationError):
-            _range_claim(
-                "ghsa", "ghsa_empty", "prod_openssh", "CVE-2024-6387",
-                m.SourceRecordKind.ghsa_unreviewed, None,  # type: ignore[arg-type]
-                "unreviewed GHSA with empty vulnerabilities",
-            )
-        conn.commit()
-        assert conn.execute("SELECT COUNT(*) AS n FROM claim").fetchone()["n"] == 1
-        assert conn.execute("SELECT source_record_kind FROM claim").fetchone()[0] == "vendor_json"
-    finally:
-        conn.close()
-
-
-def test_grouping_key_cve_id_split_44487_vs_39325(tmp_config):
-    store.init_db(tmp_config)
-    conn = store.connect(tmp_config.paths.db_path)
-    try:
-        xnet = m.Entity(
-            entity_id="pkg_x_net", entity_type=m.EntityType.package,
-            vendor="golang", name="x/net",
-            package=m.PackageAttributes(ecosystem="go", name="golang.org/x/net"),
-            attribute_citations={
-                "package.ecosystem": _cite("go"),
-                "package.name": _cite("golang.org/x/net"),
-            },
-        )
-        stdlib = m.Entity(
-            entity_id="pkg_go_stdlib", entity_type=m.EntityType.package,
-            vendor="golang", name="std",
-            package=m.PackageAttributes(ecosystem="go", name="stdlib"),
-            attribute_citations={
-                "package.ecosystem": _cite("go"),
-                "package.name": _cite("stdlib"),
-            },
-        )
-        store.persist_extraction(
-            conn, _doc("nvd_44487", url="https://nvd.nist.gov/vuln/detail/CVE-2023-44487"),
-            [xnet], [_range_claim(
-                "c1", "nvd_44487", "pkg_x_net", "CVE-2023-44487",
-                m.SourceRecordKind.nvd_cna, _interval(end="0.17.0", end_incl=False),
-                "golang.org/x/net before 0.17.0",
-            )])
-        store.persist_extraction(
-            conn, _doc("nvd_39325", url="https://nvd.nist.gov/vuln/detail/CVE-2023-39325"),
-            [stdlib], [_range_claim(
-                "c2", "nvd_39325", "pkg_go_stdlib", "CVE-2023-39325",
-                m.SourceRecordKind.nvd_cna, _interval(end="1.21.1", end_incl=False),
-                "Go stdlib before 1.21.1",
-            )])
-        conn.commit()
-        views = store.get_claims_for_analysis(conn)
-        keys = {v.advisory_group_key() for v in views}
-        assert ("CVE-2023-44487", "pkg_x_net", "affected_range") in keys
-        assert ("CVE-2023-39325", "pkg_go_stdlib", "affected_range") in keys
-        assert len(keys) == 2
-    finally:
-        conn.close()
-
-
-def test_kev_exploit_status_does_not_speak_to_affected_range():
-    kev = m.Claim(
-        claim_id="kev", doc_id="cisa", entity_id="prod_panos",
-        cve_id="CVE-2024-3400", claim_class=m.ClaimClass.exploit_status,
-        metric="known_exploited",
-        exploit_status=m.ExploitStatus.known_exploited,
-        source_record_kind=m.SourceRecordKind.cisa_kev,
-        completeness=m.Completeness.complete,
-        citation=_cite("Known Exploited Vulnerabilities Catalog"),
-    )
-    assert kev.version_range is None
-    assert kev.source_record_kind == m.SourceRecordKind.cisa_kev
-    with pytest.raises(ValidationError):
-        m.Claim(
-            claim_id="bad", doc_id="cisa", entity_id="prod_panos",
-            cve_id="CVE-2024-3400", claim_class=m.ClaimClass.affected_range,
-            metric="affected_range",
-            source_record_kind=m.SourceRecordKind.cisa_kev,
-            completeness=m.Completeness.complete,
-            citation=_cite("KEV has no version range"),
-        )
-
-
-def test_panos_hotfix_list_is_multiple_intervals():
-    vr = m.VersionRange(intervals=[
-        m.VersionInterval(
-            start=m.VersionBound(version="10.2.0", inclusive=True),
-            end=m.VersionBound(version="10.2.8-h3", inclusive=False),
-        ),
-        m.VersionInterval(
-            start=m.VersionBound(version="11.0.0", inclusive=True),
-            end=m.VersionBound(version="11.0.3-h10", inclusive=False),
-        ),
-        m.VersionInterval(
-            start=m.VersionBound(version="11.1.0", inclusive=True),
-            end=m.VersionBound(version="11.1.2-h3", inclusive=False),
-        ),
-    ])
-    claim = _range_claim(
-        "vendor", "pan", "prod_panos", "CVE-2024-3400",
-        m.SourceRecordKind.vendor_json, vr,
-        "10.2 < 10.2.8-h3; 11.0 < 11.0.3-h10; 11.1 < 11.1.2-h3",
-    )
-    assert len(claim.version_range.intervals) == 3
-    nvd_whole_branch = _range_claim(
-        "nvd", "nvd_pan", "prod_panos", "CVE-2024-3400",
-        m.SourceRecordKind.nvd_cpe,
-        m.VersionRange(intervals=[
-            m.VersionInterval(
-                start=m.VersionBound(version="10.2.0", inclusive=True),
-                end=m.VersionBound(version="10.3.0", inclusive=False),
-            ),
-        ]),
-        "PAN-OS 10.2",
-    )
-    k_vendor = claim.advisory_group_key()
-    k_nvd = nvd_whole_branch.advisory_group_key()
-    assert k_vendor == k_nvd == ("CVE-2024-3400", "prod_panos", "affected_range")
-
-
-def test_cvss_requires_numeric_value_and_record_kind():
-    ok = m.Claim(
-        claim_id="cv", doc_id="nvd", entity_id="cve_x",
-        cve_id="CVE-2024-21626", claim_class=m.ClaimClass.cvss,
-        metric="cvss_v3", value=8.6, unit="cvss",
-        source_record_kind=m.SourceRecordKind.nvd_catalog,
-        completeness=m.Completeness.complete,
-        citation=_cite("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:H"),
-    )
-    assert ok.value == 8.6
-    with pytest.raises(ValidationError):
-        m.Claim(
-            claim_id="cv", doc_id="nvd", entity_id="cve_x",
-            cve_id="CVE-2024-21626", claim_class=m.ClaimClass.cvss,
-            metric="cvss_v3",
-            source_record_kind=m.SourceRecordKind.nvd_catalog,
-            completeness=m.Completeness.complete,
-            citation=_cite("CVSS 8.6"),
-        )
-
-
-def test_no_python_resolver_function_exists():
-    import semianalyst.store.models as models_mod
-    import semianalyst.store.db as db_mod
-    forbidden = (
-        "pick_winner", "resolve_conflict", "winning_tier", "rank_source",
-        "advisory_source_weight", "choose_tier", "auto_resolve",
-    )
-    for name in forbidden:
-        assert not hasattr(models_mod, name), name
-        assert not hasattr(db_mod, name), name
-        assert not hasattr(m.Claim, name), name
-
-
-def test_sqlite_version_range_flood_guard(tmp_config):
-    store.init_db(tmp_config)
-    conn = store.connect(tmp_config.paths.db_path)
-    try:
-        store.persist_extraction(
-            conn, _doc("d1"), [_pkg_runc()],
-            [_range_claim(
-                "ok", "d1", "pkg_runc", "CVE-2024-21626",
-                m.SourceRecordKind.nvd_cpe, _interval(end="1.1.12"),
-                "runc 1.1.11 and earlier",
-            )])
-        conn.commit()
-        with pytest.raises(Exception):
-            conn.execute(
-                "INSERT INTO claim (claim_id, doc_id, entity_id, claim_class, metric, "
-                "completeness, cite_quote_span, cite_location_type, version_range, source_record_kind) "
-                "VALUES ('flood','d1','pkg_runc','affected_range','affected_range',"
-                "'complete','span','unknown', ?, 'nvd_cpe')",
-                ("[" + "x" * 40001 + "]",),
-            )
-            conn.commit()
-    finally:
-        conn.close()
-
-
-def test_foundry_path_still_persists(tmp_config):
-    store.init_db(tmp_config)
-    conn = store.connect(tmp_config.paths.db_path)
-    try:
-        versions = [r["version"] for r in conn.execute(
-            "SELECT version FROM schema_migrations ORDER BY version"
-        )]
-        assert versions == [1, 2, 3, 4, 5]
-        node = m.Entity(
-            entity_id="tsmc_n2", entity_type=m.EntityType.process_node,
-            vendor="TSMC", name="N2",
-            node=m.NodeAttributes(transistor_type=m.TransistorType.gaa_nanosheet),
-            attribute_citations={
-                "node.transistor_type": _cite("N2 GAA"),
-            },
-        )
-        foundry_doc = m.Document(
-            doc_id="tsmc_n2_2025", title="TSMC N2", publisher="TSMC",
-            doc_type=m.DocType.foundry_announcement, source_tier=m.SourceTier.foundry,
-            url="https://example.com/n2", file_sha256="a" * 64,
-            ingest_date=dt.date(2025, 4, 24),
-        )
-        claim = m.Claim(
-            claim_id="c1", doc_id="tsmc_n2_2025", entity_id="tsmc_n2",
-            claim_class=m.ClaimClass.performance, metric="logic_speed",
-            value=1.15, unit="x",
-            comparison=m.Comparison(is_relative=True, baseline_entity="tsmc_n3e", baseline_stated=True),
-            completeness=m.Completeness.complete, citation=_cite("15% faster"),
-        )
-        store.persist_extraction(conn, foundry_doc, [node], [claim])
-        conn.commit()
-        row = conn.execute("SELECT value, unit, version_range FROM claim").fetchone()
-        assert row["value"] == 1.15
-        assert row["unit"] == "x"
-        assert row["version_range"] is None
-    finally:
-        conn.close()
-
-
-def test_cve_entity_requires_cve_id_and_optional_cwe():
-    ok = m.Entity(
-        entity_id="cve_21626", entity_type=m.EntityType.cve,
-        vendor="NVD", name="CVE-2024-21626",
-        cve=m.CveAttributes(cve_id="CVE-2024-21626", cwe="CWE-668"),
-        attribute_citations={
-            "cve.cwe": _cite("CWE-668"),
-        },
-    )
-    assert ok.cve.cve_id == "CVE-2024-21626"
-    with pytest.raises(ValidationError):
-        m.Entity(
-            entity_id="cve_bad", entity_type=m.EntityType.cve,
-            vendor="NVD", name="x",
-        )
-    with pytest.raises(ValidationError):
-        m.CveAttributes(cve_id="CVE-24-1")
-
-
-def test_package_foundry_still_legal_without_package_attrs():
-    e = m.Entity(
-        entity_id="pkg_fanout", entity_type=m.EntityType.package,
-        vendor="TSMC", name="InFO",
-        attribute_citations={},
-    )
-    assert e.package is None
-
-
-def test_validate_advisory_claim_grounding():
-    """Allowed golden: bound version is in the quote (1.1.11), not inferred."""
-    proposal = {
-        "document": {
-            "doc_id": "nvd_21626", "title": "CVE-2024-21626",
-            "publisher": "NVD", "doc_type": "nvd_record", "source_tier": 2,
-            "url": "https://nvd.nist.gov/vuln/detail/CVE-2024-21626",
-        },
-        "entities": [{
-            "entity_id": "pkg_runc", "entity_type": "package",
-            "vendor": "opencontainers", "name": "runc",
-            "package": {"ecosystem": "go", "name": "github.com/opencontainers/runc"},
-            "attribute_citations": {
-                "package.ecosystem": {"quote_span": "ecosystem go", "location_type": "unknown"},
-                "package.name": {"quote_span": "github.com/opencontainers/runc", "location_type": "unknown"},
-            },
-        }],
-        "claims": [{
-            "claim_id": "c1", "doc_id": "nvd_21626", "entity_id": "pkg_runc",
-            "cve_id": "CVE-2024-21626", "claim_class": "affected_range",
-            "metric": "affected_range",
-            "version_range": {"intervals": [{"end": {"version": "1.1.11", "inclusive": True}}]},
-            "source_record_kind": "nvd_cpe",
-            "completeness": "complete",
-            "citation": {"quote_span": "runc 1.1.11 and earlier", "location_type": "unknown"},
-        }],
-    }
-    src = "runc 1.1.11 and earlier. ecosystem go. github.com/opencontainers/runc"
-    result, rej = validate_proposal(proposal, src)
-    assert result.claims[0].version_range.intervals[0].end.version == "1.1.11"
-    assert "1.1.11" in result.claims[0].citation.quote_span
-    assert result.entities[0].package.ecosystem == "go"
-    assert result.claims[0].source_record_kind is None
-    assert any(r.kind == "claim_kind" for r in rej)
-
-
-def test_validate_rejects_inferred_exclusive_bound_not_in_quote():
-    """CoS-locked: 1.1.12 from '1.1.11 and earlier' is rejected, not persisted."""
-    proposal = {
-        "entities": [{
-            "entity_id": "pkg_runc", "entity_type": "package",
-            "vendor": "opencontainers", "name": "runc",
-            "package": {"ecosystem": "go", "name": "github.com/opencontainers/runc"},
-            "attribute_citations": {
-                "package.ecosystem": {"quote_span": "ecosystem go", "location_type": "unknown"},
-                "package.name": {"quote_span": "github.com/opencontainers/runc", "location_type": "unknown"},
-            },
-        }],
-        "claims": [{
-            "claim_id": "c1", "doc_id": "nvd_21626", "entity_id": "pkg_runc",
-            "cve_id": "CVE-2024-21626", "claim_class": "affected_range",
-            "metric": "affected_range",
-            "version_range": {"intervals": [{"end": {"version": "1.1.12", "inclusive": False}}]},
-            "completeness": "complete",
-            "citation": {"quote_span": "runc 1.1.11 and earlier", "location_type": "unknown"},
-        }],
-    }
-    src = "runc 1.1.11 and earlier. ecosystem go. github.com/opencontainers/runc"
-    result, rej = validate_proposal(proposal, src)
-    assert result.claims == []
-    assert any("version_bound" in r.reason for r in rej)

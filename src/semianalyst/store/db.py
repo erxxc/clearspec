@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import re
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import Config, load_config
@@ -221,9 +222,6 @@ def conflict_counts_by_entity(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
-from dataclasses import dataclass
-
-
 @dataclass(frozen=True)
 class ClaimView:
     claim_id: str
@@ -241,9 +239,15 @@ class ClaimView:
     claim_class: str = ""
     source_record_kind: str | None = None
     cve_id: str | None = None
+    version_range: dict | None = None
+    exploit_status: str | None = None
+    workaround_text: str | None = None
 
     def advisory_group_key(self) -> tuple[str, str, str]:
-        """GEI-9 grouping key, representation only — never a resolver."""
+        """GEI-9 grouping key (cve_id, package_or_product, claim_class).
+
+        Representation only — never a resolver; never picks a winning kind.
+        """
         return (self.cve_id or "", self.entity_id, self.claim_class)
 
 
@@ -448,13 +452,18 @@ def get_claims_for_analysis(conn: sqlite3.Connection) -> list[ClaimView]:
             "SELECT c.claim_id, c.doc_id, c.entity_id, c.metric, c.value, c.unit, "
             "       c.cmp_is_relative, c.cmp_baseline_entity, c.cond_sparsity, "
             "       c.completeness, d.source_tier, d.publisher, "
-            "       c.claim_class, c.source_record_kind, c.cve_id "
+            "       c.claim_class, c.source_record_kind, c.cve_id, "
+            "       c.version_range, c.exploit_status, c.workaround_text "
             "FROM claim c JOIN document d ON c.doc_id = d.doc_id"
         ).fetchall()
     except sqlite3.OperationalError as exc:
         raise _translate_missing_schema(exc) from exc
-    return [
-        ClaimView(
+    out: list[ClaimView] = []
+    for r in rows:
+        vr = r["version_range"]
+        if isinstance(vr, str):
+            vr = json.loads(vr)
+        out.append(ClaimView(
             claim_id=r["claim_id"], doc_id=r["doc_id"], entity_id=r["entity_id"],
             metric=r["metric"], value=r["value"], unit=r["unit"] or "",
             is_relative=bool(r["cmp_is_relative"]),
@@ -465,9 +474,11 @@ def get_claims_for_analysis(conn: sqlite3.Connection) -> list[ClaimView]:
             claim_class=r["claim_class"],
             source_record_kind=r["source_record_kind"],
             cve_id=r["cve_id"],
-        )
-        for r in rows
-    ]
+            version_range=vr,
+            exploit_status=r["exploit_status"],
+            workaround_text=r["workaround_text"],
+        ))
+    return out
 
 
 def report_counts(config: Config | None = None) -> dict[str, int]:

@@ -203,12 +203,26 @@ def report() -> None:
         aliases = [_ansi_safe(a) for a in info["aliases"]]
         typer.echo(f"{_ansi_safe(entity_id)}  aliases={aliases}")
     for a in analysis.assessments:
-        line = f"  [{a.status}] {_ansi_safe(a.metric)}"
-        if a.baseline_entity:
-            line += f" vs {_ansi_safe(a.baseline_entity)}"
-        line += f"  range={a.value_range} tiers={a.tiers} confidence={a.confidence}"
+        # Advisory: prefer claim_class + set_relation + status. Never interpolate
+        # raw workaround_text (injection surface). Never invent a winning range.
+        if a.claim_class:
+            label = _ansi_safe(a.claim_class)
+            line = f"  [{a.status}] {label}"
+            if a.cve_id:
+                line += f" {_ansi_safe(a.cve_id)}"
+            line += f" {_ansi_safe(a.entity_id)}"
+            if a.set_relation:
+                line += f" set_relation={_ansi_safe(a.set_relation)}"
+            line += f" tiers={a.tiers} confidence={a.confidence}"
+        else:
+            line = f"  [{a.status}] {_ansi_safe(a.metric)}"
+            if a.baseline_entity:
+                line += f" vs {_ansi_safe(a.baseline_entity)}"
+            line += f"  range={a.value_range} tiers={a.tiers} confidence={a.confidence}"
         if a.flags:
             line += f" flags={a.flags}"
+        if a.favored_tier is not None:
+            line += f" favored_tier={a.favored_tier}"
         typer.echo(line)
     if analysis.conflicts:
         # The conflict record exists to be read by a human — which makes
