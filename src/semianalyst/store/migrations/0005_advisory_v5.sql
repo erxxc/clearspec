@@ -131,7 +131,7 @@ CREATE TABLE claim_v5 (
                              'nvd_exploit_field','ghsa_exploit_field',
                              'peer_research')),
     version_range         TEXT CHECK (version_range IS NULL OR length(version_range) <= 40000),
-    exploit_status        TEXT CHECK (exploit_status IS NULL OR exploit_status IS NULL OR exploit_status IN
+    exploit_status        TEXT CHECK (exploit_status IS NULL OR exploit_status IN
                             ('known_exploited','no_known_exploit','disputed')),
     workaround_text       TEXT CHECK (workaround_text IS NULL OR length(workaround_text) <= 500)
 );
