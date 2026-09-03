@@ -1,9 +1,13 @@
 """PromptVersion — prompts are versioned artifacts, loaded from prompts/.
 
-Prompts are never edited in place: a change means a new file (extract_foundry_v2.md),
-so every extraction run can be tied to the exact prompt bytes that produced it.
-`PromptVersion.sha256` is that provenance handle — record it (alongside the model
-name) in Document.extraction_model when a run happens, so re-runs are reproducible.
+Prompts are never edited in place: a change means a new file
+(extract_foundry_v2.md / extract_advisory_v2.md), so every extraction run can
+be tied to the exact prompt bytes that produced it.
+`PromptVersion.sha256` is that provenance handle — record it (alongside the
+model name) in Document.extraction_model when a run happens, so re-runs are
+reproducible.
+
+Known immutable prompts (once golden): extract_foundry_v1, extract_advisory_v1.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ PROMPTS_DIR = REPO_ROOT / "prompts"
 
 @dataclass(frozen=True)
 class PromptVersion:
-    name: str          # e.g. "extract_foundry_v1"
+    name: str          # e.g. "extract_foundry_v1" or "extract_advisory_v1"
     text: str
     sha256: str        # hash of the prompt bytes — provenance for re-runs
 

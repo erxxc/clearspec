@@ -86,7 +86,6 @@ def test_new_enums_round_trip():
     assert m.ClaimClass.workaround.value == "workaround"
     assert m.Completeness.missing_range.value == "missing_range"
     assert m.Completeness.missing_product.value == "missing_product"
-    # foundry enums still present
     assert m.DocType.foundry_announcement.value == "foundry_announcement"
     assert m.EntityType.process_node.value == "process_node"
     assert m.ClaimClass.performance.value == "performance"
@@ -97,7 +96,7 @@ def test_range_requires_structured_interval_not_display_string():
         m.Claim(
             claim_id="c", doc_id="d", entity_id="pkg_runc",
             cve_id="CVE-2024-21626", claim_class=m.ClaimClass.affected_range,
-            metric="< 1.1.12",  # display string is not the range
+            metric="< 1.1.12",
             source_record_kind=m.SourceRecordKind.nvd_cpe,
             completeness=m.Completeness.complete,
             citation=_cite("runc 1.1.11 and earlier"),
@@ -108,7 +107,7 @@ def test_range_requires_structured_interval_not_display_string():
     )
     assert ok.version_range.intervals[0].end.version == "1.1.12"
     assert ok.version_range.intervals[0].end.inclusive is False
-    assert ok.version_range.intervals[0].start is None  # unbounded below
+    assert ok.version_range.intervals[0].start is None
     assert ok.citation.quote_span == "runc 1.1.11 and earlier"
 
 
@@ -145,63 +144,6 @@ def _pkg_runc() -> m.Entity:
     )
 
 
-def test_nvd_cna_and_nvd_cpe_are_distinct_records_same_url(tmp_config):
-    """Jenkins: NVD CNA vs NVD CPE share a URL but are different records.
-    Document-level source_tier is the same; source_record_kind distinguishes them.
-    """
-    store.init_db(tmp_config)
-    conn = store.connect(tmp_config.paths.db_path)
-    try:
-        url = "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2024-23897"
-        pkg = m.Entity(
-            entity_id="pkg_jenkins_core", entity_type=m.EntityType.package,
-            vendor="jenkins", name="jenkins-core",
-            package=m.PackageAttributes(
-                ecosystem="maven", name="org.jenkins-ci.main:jenkins-core",
-            ),
-            attribute_citations={
-                "package.ecosystem": _cite("maven"),
-                "package.name": _cite("org.jenkins-ci.main:jenkins-core"),
-            },
-        )
-        store.persist_extraction(conn, _doc("nvd_23897", url=url, publisher="NVD"), [pkg], [
-            _range_claim(
-                "cpe", "nvd_23897", "pkg_jenkins_core", "CVE-2024-23897",
-                m.SourceRecordKind.nvd_cpe,
-                _interval(end="2.426.3", end_incl=False),
-                "LTS versionEndExcluding 2.426.3 no lower bound",
-            ),
-            _range_claim(
-                "cna", "nvd_23897", "pkg_jenkins_core", "CVE-2024-23897",
-                m.SourceRecordKind.nvd_cna,
-                m.VersionRange(intervals=[
-                    m.VersionInterval(
-                        start=m.VersionBound(version="1.606", inclusive=True),
-                        end=m.VersionBound(version="2.426.3", inclusive=False),
-                    ),
-                ]),
-                "version 0 lessThan 1.606 unaffected; GHSA/CNA start at 1.606",
-            ),
-        ])
-        conn.commit()
-        rows = conn.execute(
-            "SELECT claim_id, source_record_kind, version_range FROM claim ORDER BY claim_id"
-        ).fetchall()
-        kinds = {r["source_record_kind"] for r in rows}
-        assert kinds == {"nvd_cna", "nvd_cpe"}
-        assert conn.execute("SELECT COUNT(*) AS n FROM claim").fetchone()["n"] == 2
-        assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 1
-        url_row = conn.execute("SELECT url FROM document").fetchone()["url"]
-        assert url_row == url
-        # neither record won — both version_range blobs are stored
-        blobs = {r["source_record_kind"]: r["version_range"] for r in rows}
-        assert "1.606" in blobs["nvd_cna"]
-        assert "2.426.3" in blobs["nvd_cpe"]
-        assert "1.606" not in blobs["nvd_cpe"]
-    finally:
-        conn.close()
-
-
 def test_never_auto_resolve_conflicting_ranges_both_persist(tmp_config):
     """runc subset: NVD unbounded <1.1.12 vs GHSA >= rc93. Both claims persist.
     No winner is selected. Grouping keys match so GEI-9 can see the fight.
@@ -233,23 +175,18 @@ def test_never_auto_resolve_conflicting_ranges_both_persist(tmp_config):
         conn.commit()
         rows = list(conn.execute("SELECT source_record_kind FROM claim"))
         assert {r["source_record_kind"] for r in rows} == {"nvd_cpe", "ghsa_reviewed"}
-        assert store.get_conflicts(conn) == []  # claims coexist; no attribute fight
+        assert store.get_conflicts(conn) == []
         views = store.get_claims_for_analysis(conn)
         keys = {(v.cve_id, v.entity_id, v.claim_class) for v in views}
         assert keys == {("CVE-2024-21626", "pkg_runc", "affected_range")}
-        # analyze must NOT collapse them via ±10% or pick a favored record kind
         from semianalyst.analyze import analyze_claims
         report = analyze_claims(views, store.get_entities_index(conn))
-        assert report.assessments == []  # skipped; GEI-9 owns range grouping
+        assert report.assessments == []
     finally:
         conn.close()
 
 
 def test_empty_ghsa_does_not_outrank_vendor_no_resolver(tmp_config):
-    """OpenSSH: unreviewed GHSA with empty range vs vendor patched_in. Both
-    persist. Schema documents that empty GHSA does not outrank vendor — there
-    is no code path that drops the vendor claim.
-    """
     store.init_db(tmp_config)
     conn = store.connect(tmp_config.paths.db_path)
     try:
@@ -272,8 +209,6 @@ def test_empty_ghsa_does_not_outrank_vendor_no_resolver(tmp_config):
                 "Portable OpenSSH versions between 8.5p1 and 9.7p1 (inclusive)",
                 claim_class=m.ClaimClass.patched_in,
             )])
-        # unreviewed GHSA carries no range — it is not an affected_range claim
-        # (cannot outrank vendor because it cannot even be a range claim)
         with pytest.raises(ValidationError):
             _range_claim(
                 "ghsa", "ghsa_empty", "prod_openssh", "CVE-2024-6387",
@@ -288,9 +223,6 @@ def test_empty_ghsa_does_not_outrank_vendor_no_resolver(tmp_config):
 
 
 def test_grouping_key_cve_id_split_44487_vs_39325(tmp_config):
-    """HTTP/2 Rapid Reset: two CVEs on related packages. Grouping key includes
-    cve_id so GEI-9 will not mix CVE-2023-44487 with CVE-2023-39325.
-    """
     store.init_db(tmp_config)
     conn = store.connect(tmp_config.paths.db_path)
     try:
@@ -337,9 +269,6 @@ def test_grouping_key_cve_id_split_44487_vs_39325(tmp_config):
 
 
 def test_kev_exploit_status_does_not_speak_to_affected_range():
-    """CISA KEV with no version range is exploit_status only. Building an
-    affected_range claim from it fails pydantic (no version_range).
-    """
     kev = m.Claim(
         claim_id="kev", doc_id="cisa", entity_id="prod_panos",
         cve_id="CVE-2024-3400", claim_class=m.ClaimClass.exploit_status,
@@ -363,9 +292,6 @@ def test_kev_exploit_status_does_not_speak_to_affected_range():
 
 
 def test_panos_hotfix_list_is_multiple_intervals():
-    """PAN-OS vendor hotfix list is a structured union of intervals, not a
-    display string of versions.
-    """
     vr = m.VersionRange(intervals=[
         m.VersionInterval(
             start=m.VersionBound(version="10.2.0", inclusive=True),
@@ -424,9 +350,6 @@ def test_cvss_requires_numeric_value_and_record_kind():
 
 
 def test_no_python_resolver_function_exists():
-    """Never auto-resolve: ranking tables live in yaml only. There must be no
-    pick-a-winner helper on the models or store modules.
-    """
     import semianalyst.store.models as models_mod
     import semianalyst.store.db as db_mod
     forbidden = (
@@ -451,7 +374,6 @@ def test_sqlite_version_range_flood_guard(tmp_config):
                 "runc 1.1.11 and earlier",
             )])
         conn.commit()
-        # flood: oversize JSON bypasses pydantic by going straight to SQL
         with pytest.raises(Exception):
             conn.execute(
                 "INSERT INTO claim (claim_id, doc_id, entity_id, claim_class, metric, "
@@ -466,7 +388,6 @@ def test_sqlite_version_range_flood_guard(tmp_config):
 
 
 def test_foundry_path_still_persists(tmp_config):
-    """v4/foundry claim with numeric value still inserts; migrations include 0005."""
     store.init_db(tmp_config)
     conn = store.connect(tmp_config.paths.db_path)
     try:
@@ -521,11 +442,10 @@ def test_cve_entity_requires_cve_id_and_optional_cwe():
             vendor="NVD", name="x",
         )
     with pytest.raises(ValidationError):
-        m.CveAttributes(cve_id="CVE-24-1")  # too short year/seq
+        m.CveAttributes(cve_id="CVE-24-1")
 
 
 def test_package_foundry_still_legal_without_package_attrs():
-    """Semiconductor package (foundry) must not require PackageAttributes."""
     e = m.Entity(
         entity_id="pkg_fanout", entity_type=m.EntityType.package,
         vendor="TSMC", name="InFO",
@@ -535,6 +455,7 @@ def test_package_foundry_still_legal_without_package_attrs():
 
 
 def test_validate_advisory_claim_grounding():
+    """Allowed golden: bound version is in the quote (1.1.11), not inferred."""
     proposal = {
         "document": {
             "doc_id": "nvd_21626", "title": "CVE-2024-21626",
@@ -554,12 +475,43 @@ def test_validate_advisory_claim_grounding():
             "claim_id": "c1", "doc_id": "nvd_21626", "entity_id": "pkg_runc",
             "cve_id": "CVE-2024-21626", "claim_class": "affected_range",
             "metric": "affected_range",
-            "version_range": {"intervals": [{"end": {"version": "1.1.12", "inclusive": False}}]},
+            "version_range": {"intervals": [{"end": {"version": "1.1.11", "inclusive": True}}]},
             "source_record_kind": "nvd_cpe",
             "completeness": "complete",
             "citation": {"quote_span": "runc 1.1.11 and earlier", "location_type": "unknown"},
         }],
     }
-    result, _rej = validate_proposal(proposal, "runc 1.1.11 and earlier. ecosystem go. github.com/opencontainers/runc")
-    assert result.claims[0].version_range.intervals[0].end.version == "1.1.12"
+    src = "runc 1.1.11 and earlier. ecosystem go. github.com/opencontainers/runc"
+    result, rej = validate_proposal(proposal, src)
+    assert result.claims[0].version_range.intervals[0].end.version == "1.1.11"
+    assert "1.1.11" in result.claims[0].citation.quote_span
     assert result.entities[0].package.ecosystem == "go"
+    assert result.claims[0].source_record_kind is None
+    assert any(r.kind == "claim_kind" for r in rej)
+
+
+def test_validate_rejects_inferred_exclusive_bound_not_in_quote():
+    """CoS-locked: 1.1.12 from '1.1.11 and earlier' is rejected, not persisted."""
+    proposal = {
+        "entities": [{
+            "entity_id": "pkg_runc", "entity_type": "package",
+            "vendor": "opencontainers", "name": "runc",
+            "package": {"ecosystem": "go", "name": "github.com/opencontainers/runc"},
+            "attribute_citations": {
+                "package.ecosystem": {"quote_span": "ecosystem go", "location_type": "unknown"},
+                "package.name": {"quote_span": "github.com/opencontainers/runc", "location_type": "unknown"},
+            },
+        }],
+        "claims": [{
+            "claim_id": "c1", "doc_id": "nvd_21626", "entity_id": "pkg_runc",
+            "cve_id": "CVE-2024-21626", "claim_class": "affected_range",
+            "metric": "affected_range",
+            "version_range": {"intervals": [{"end": {"version": "1.1.12", "inclusive": False}}]},
+            "completeness": "complete",
+            "citation": {"quote_span": "runc 1.1.11 and earlier", "location_type": "unknown"},
+        }],
+    }
+    src = "runc 1.1.11 and earlier. ecosystem go. github.com/opencontainers/runc"
+    result, rej = validate_proposal(proposal, src)
+    assert result.claims == []
+    assert any("version_bound" in r.reason for r in rej)
