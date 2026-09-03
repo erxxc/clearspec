@@ -5,6 +5,7 @@ No other package should import `sqlite3` or write SQL.
 """
 
 from . import models
+from .attestation import KIND_COMPAT, attested_kind, identity_material, kind_from_sidecar, stamp_advisory_claims
 from .db import (
     ClaimView,
     StoreNotInitialized,
@@ -28,6 +29,11 @@ from .persist import persist_extraction
 
 __all__ = [
     "models",
+    "KIND_COMPAT",
+    "attested_kind",
+    "identity_material",
+    "kind_from_sidecar",
+    "stamp_advisory_claims",
     "ClaimView",
     "StoreNotInitialized",
     "conflict_counts_by_entity",
