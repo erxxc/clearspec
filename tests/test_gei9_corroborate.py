@@ -135,11 +135,36 @@ def test_ranges_do_not_use_numeric_tolerance():
     out = analyze_claims([a, b], _INDEX).assessments[0]
     assert out.set_relation != "equal"
     assert out.status == "contradicted"
-    # And the foundry TOLERANCE_PCT is not consulted for ranges
+    # Range branch must not consult the foundry numeric ruler; cvss may.
     src = inspect.getsource(corroborate_mod._assess_advisory)
-    assert "TOLERANCE_PCT" not in src or "claim_class == \"cvss\"" in inspect.getsource(
-        corroborate_mod._assess_advisory
-    )
+    range_idx = src.find("if claim_class in _RANGE_CLASSES")
+    cvss_idx = src.find('claim_class == "cvss"')
+    assert 0 <= range_idx < cvss_idx
+    assert "TOLERANCE_PCT" not in src[range_idx:cvss_idx]
+    assert "compare_version_ranges" in inspect.getsource(corroborate_mod)
+
+
+def test_empty_cve_id_does_not_collapse_groups():
+    """Empty cve_id must not merge unrelated advisory range claims."""
+    a = _cv("a", claim_class="affected_range", cve_id=None, publisher="A",
+            version_range=_iv(end="1.0"))
+    b = _cv("b", claim_class="affected_range", cve_id="", publisher="B",
+            version_range=_iv(end="2.0"))
+    rep = analyze_claims([a, b], _INDEX)
+    assert len(rep.assessments) == 2
+    assert {m for a in rep.assessments for m in a.members} == {"a", "b"}
+
+
+def test_missing_version_range_in_group_is_not_agree():
+    """SQL CHECK covers persist; in-memory missing range must not corroborate."""
+    a = _cv("a", claim_class="affected_range", cve_id="CVE-M", publisher="A",
+            version_range=_iv(end="1.0"))
+    b = _cv("b", claim_class="affected_range", cve_id="CVE-M", publisher="B",
+            version_range=None)
+    out = analyze_claims([a, b], _INDEX).assessments[0]
+    assert out.status == "contradicted"
+    assert "missing_version_range" in out.flags
+    assert set(out.members) == {"a", "b"}
 
 
 # --- 3. cvss numeric + exploit_status enum ---
