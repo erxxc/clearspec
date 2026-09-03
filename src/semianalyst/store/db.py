@@ -251,3 +251,10 @@ class ClaimView:
         Representation only — never a resolver; never picks a winning kind.
         """
         return (self.cve_id or "", self.entity_id, self.claim_class)
+
+
+# GEI-9: remainder lives in _db_tail.py (same module globals via exec).
+from pathlib import Path as _DBPath
+_tail = _DBPath(__file__).with_name("_db_tail.py")
+exec(compile(_tail.read_text(), str(_tail), "exec"), globals())
+del _DBPath, _tail
