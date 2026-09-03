@@ -1,4 +1,52 @@
-"""Validation + normalization — the LLM proposal is a PROPOSAL, not truth."""
+"""Validation + normalization — the LLM proposal is a PROPOSAL, not truth.
+
+`build_result` turns a raw model proposal (dict of entities + claims) into a
+grounded `ExtractionResult`, enforcing the schema's integrity rules in code:
+
+  1. Shape       — per-item pydantic validation; a malformed item is dropped
+                   (with a rejection), never fatal to the whole extraction.
+  2. Normalize   — month-precision dates -> first-of-month; units -> canonical.
+  3. Ground      — every claim quote_span AND every entity attribute_citation
+                   quote_span must appear in the source text, else the claim is
+                   dropped / the attribute is nulled. Identity is grounded too
+                   (2026-08-18 gate): an entity whose name or vendor never
+                   appears in the source is dropped, and an ungrounded alias is
+                   dropped from its list (G1) — both case-insensitive presence
+                   floors (existence, not verbatim-quote proof).
+  4. Provenance  — a claim must be about an entity extracted from THIS document
+                   (claim.entity_id present in the proposal), else it's dropped.
+  5. Integrity   — a relative claim must use a ratio/percent unit (never an
+                   absolute one); a pure-ratio unit (x) requires is_relative; a
+                   relative claim with no baseline is downgraded to
+                   missing_baseline (the model's `completeness` is not trusted);
+                   sparsity + cross-vendor comparison -> marketing_only;
+                   sparse-benchmark vocabulary in the grounded quote_span
+                   force-sets sparsity=True (self-declaration is not trusted in
+                   the non-suspect direction — fails toward suspect).
+  6. Fail-safe   — flat-text extraction can't place a quote, so every citation's
+                   location_type is forced to `unknown` (never `body`).
+  7. Dedup       — one entity per (vendor, name), both case-folded; aliases,
+                   attribute VALUES, and their citations are all reconciled into
+                   the surviving entity.
+                   The canonical `name` is always pinned into `aliases` — it is a
+                   surface form of the entity, and models repeat it inconsistently.
+  8. Kind        — `source_record_kind` is ingest-attested (sidecar / CNA-vs-CPE
+                   parser), never model-emitted. A proposal that self-attests
+                   ghsa_reviewed / nvd_cna / cisa_kev has that field stripped
+                   here; persist stamps the ingest kind. Yaml ranking must not
+                   treat a researcher_writeup's self-attest as high-weight.
+
+Rejections carry only a kind, a model-supplied identifier/path (sanitized before
+logging), and a fixed reason string — never raw model text values, which under
+injection could carry a hostile string. `validate_proposal` returns them for
+tests; `build_result` returns just the cleaned result.
+
+NOTE (store-workstream prerequisite): validate enforces a per-DOCUMENT trust
+boundary only. Cross-document entity reconciliation lives in store/; persistence
+must not ship until `INSERT OR REPLACE` there is replaced with real reconciliation
+(see CLAUDE.md) — otherwise a later document silently overwrites an entity an
+earlier one created.
+"""
 
 from __future__ import annotations
 
@@ -128,12 +176,24 @@ def validate_proposal(
                                         f"shape invalid at {[e['loc'] for e in exc.errors()]}"))
     claims: list[models.Claim] = []
     for raw_claim in normalized.get("claims", []):
+        # source_record_kind is ingest-attested. Strip it before pydantic so a
+        # hostile proposal cannot self-attest ghsa_reviewed / nvd_cna / cisa_kev.
+        emitted_kind = None
+        if isinstance(raw_claim, dict) and "source_record_kind" in raw_claim:
+            emitted_kind = raw_claim.pop("source_record_kind")
         try:
-            claims.append(models.Claim.model_validate(raw_claim))
+            claim = models.Claim.model_validate(raw_claim)
         except ValidationError as exc:
             cid = raw_claim.get("claim_id", "?") if isinstance(raw_claim, dict) else "?"
             rejections.append(Rejection("claim", str(cid),
                                         f"shape invalid at {[e['loc'] for e in exc.errors()]}"))
+            continue
+        if emitted_kind is not None:
+            rejections.append(Rejection(
+                "claim_kind", claim.claim_id,
+                "source_record_kind is ingest-attested; model emission stripped",
+            ))
+        claims.append(claim)
 
     kept_entities: list[models.Entity] = []
     seen: dict[tuple[str, str], models.Entity] = {}
