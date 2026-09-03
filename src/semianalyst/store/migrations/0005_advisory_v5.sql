@@ -9,10 +9,16 @@
 --     distinguished by which attribute block is populated).
 -- (3) Claim gains cve_id (grouping key), source_record_kind (NVD CNA vs NVD
 --     CPE even when they share a URL), structured version_range JSON,
---     exploit_status, workaround_text. value/unit become nullable so a range
---     is never stuffed into a float/display string.
+--     exploit_status, workaround_text. value/unit are nullable at the column
+--     type so a range is never stuffed into a float/display string — but
+--     class-conditional CHECKs restore the foundry durable invariant:
+--       foundry classes: value AND unit NOT NULL, version_range NULL
+--       affected_range/patched_in: version_range NOT NULL
+--       advisory classes: source_record_kind NOT NULL (ingest-attested)
+--     The 40000 LENGTH CHECK is the flood guard, not this invariant.
 -- (4) NEVER AUTO-RESOLVE: this migration adds storage. No trigger, generated
 --     column, or unique constraint picks a winning source_record_kind.
+--     document.url is NOT UNIQUE: CNA vs CPE are two doc_ids, same URL.
 -- JSON version_range flood guard: 32 intervals x 2 bounds x 80 chars x 6-byte
 -- escape -> 40000 (schema-purist F2 rule, same as v4 aliases/caveats).
 
@@ -133,7 +139,24 @@ CREATE TABLE claim_v5 (
     version_range         TEXT CHECK (version_range IS NULL OR length(version_range) <= 40000),
     exploit_status        TEXT CHECK (exploit_status IS NULL OR exploit_status IN
                             ('known_exploited','no_known_exploit','disputed')),
-    workaround_text       TEXT CHECK (workaround_text IS NULL OR length(workaround_text) <= 500)
+    workaround_text       TEXT CHECK (workaround_text IS NULL OR length(workaround_text) <= 500),
+    -- Class-conditional payload (GEI-7 review must-fix 1). Column types stay
+    -- nullable so range claims can omit value/unit; CHECKs re-assert 0004's
+    -- foundry NOT NULL and require structured version_range / ingest kind.
+    CONSTRAINT claim_foundry_payload CHECK (
+        claim_class NOT IN ('performance','efficiency','density','power',
+                            'yield','cost','availability')
+        OR (value IS NOT NULL AND unit IS NOT NULL AND version_range IS NULL)
+    ),
+    CONSTRAINT claim_range_payload CHECK (
+        claim_class NOT IN ('affected_range','patched_in')
+        OR version_range IS NOT NULL
+    ),
+    CONSTRAINT claim_advisory_kind CHECK (
+        claim_class NOT IN ('affected_range','patched_in','cvss',
+                            'exploit_status','workaround')
+        OR source_record_kind IS NOT NULL
+    )
 );
 INSERT INTO claim_v5 (
     claim_id, doc_id, entity_id, claim_class, metric, value, unit,
