@@ -219,3 +219,130 @@ def test_persist_stamp_overwrites_claim_kind(tmp_config):
         assert conn.execute("SELECT source_record_kind FROM claim").fetchone()[0] == "nvd_cpe"
     finally:
         conn.close()
+
+
+def test_nvd_cna_and_nvd_cpe_are_distinct_records_same_url(tmp_config):
+    """Jenkins: NVD CNA vs NVD CPE share a URL but are different records.
+
+    Two documents, two doc_ids, same URL. Two claims on one nvd_record is the
+    collapse GEI-6 forbade. Schema has no UNIQUE(url); persist identity is
+    doc_id, never url.
+    """
+    store.init_db(tmp_config)
+    conn = store.connect(tmp_config.paths.db_path)
+    try:
+        url = "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2024-23897"
+        pkg = m.Entity(
+            entity_id="pkg_jenkins_core", entity_type=m.EntityType.package,
+            vendor="jenkins", name="jenkins-core",
+            package=m.PackageAttributes(
+                ecosystem="maven", name="org.jenkins-ci.main:jenkins-core",
+            ),
+            attribute_citations={
+                "package.ecosystem": _cite("maven"),
+                "package.name": _cite("org.jenkins-ci.main:jenkins-core"),
+            },
+        )
+        store.persist_extraction(conn, _doc("nvd_23897_cpe", url=url, publisher="NVD"), [pkg], [
+            _range_claim(
+                "cpe", "nvd_23897_cpe", "pkg_jenkins_core", "CVE-2024-23897",
+                m.SourceRecordKind.nvd_cpe,
+                _interval(end="2.426.3", end_incl=False),
+                "LTS versionEndExcluding 2.426.3 no lower bound",
+            ),
+        ])
+        store.persist_extraction(conn, _doc("nvd_23897_cna", url=url, publisher="NVD"), [pkg], [
+            _range_claim(
+                "cna", "nvd_23897_cna", "pkg_jenkins_core", "CVE-2024-23897",
+                m.SourceRecordKind.nvd_cna,
+                m.VersionRange(intervals=[
+                    m.VersionInterval(
+                        start=m.VersionBound(version="1.606", inclusive=True),
+                        end=m.VersionBound(version="2.426.3", inclusive=False),
+                    ),
+                ]),
+                "version 0 lessThan 1.606 unaffected; GHSA/CNA start at 1.606",
+            ),
+        ])
+        conn.commit()
+        rows = conn.execute(
+            "SELECT claim_id, source_record_kind, version_range FROM claim ORDER BY claim_id"
+        ).fetchall()
+        kinds = {r["source_record_kind"] for r in rows}
+        assert kinds == {"nvd_cna", "nvd_cpe"}
+        assert conn.execute("SELECT COUNT(*) AS n FROM claim").fetchone()["n"] == 2
+        assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 2
+        urls = {r["url"] for r in conn.execute("SELECT url FROM document")}
+        assert urls == {url}
+        doc_ids = {r["doc_id"] for r in conn.execute("SELECT doc_id FROM document")}
+        assert doc_ids == {"nvd_23897_cpe", "nvd_23897_cna"}
+        schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='document'"
+        ).fetchone()[0]
+        assert "UNIQUE" not in schema.replace("PRIMARY KEY", "")
+        blobs = {r["source_record_kind"]: r["version_range"] for r in rows}
+        assert "1.606" in blobs["nvd_cna"]
+        assert "2.426.3" in blobs["nvd_cpe"]
+        assert "1.606" not in blobs["nvd_cpe"]
+    finally:
+        conn.close()
+
+
+def test_validate_advisory_claim_grounding():
+    """version_bound.version must appear in the quote/source (1.1.11).
+
+    Inferring exclusive bound 1.1.12 from "1.1.11 and earlier" is GEI-8
+    interval inference — not allowed golden for this pack.
+    """
+    proposal = {
+        "document": {
+            "doc_id": "nvd_21626", "title": "CVE-2024-21626",
+            "publisher": "NVD", "doc_type": "nvd_record", "source_tier": 2,
+            "url": "https://nvd.nist.gov/vuln/detail/CVE-2024-21626",
+        },
+        "entities": [{
+            "entity_id": "pkg_runc", "entity_type": "package",
+            "vendor": "opencontainers", "name": "runc",
+            "package": {"ecosystem": "go", "name": "github.com/opencontainers/runc"},
+            "attribute_citations": {
+                "package.ecosystem": {"quote_span": "ecosystem go", "location_type": "unknown"},
+                "package.name": {"quote_span": "github.com/opencontainers/runc", "location_type": "unknown"},
+            },
+        }],
+        "claims": [{
+            "claim_id": "c1", "doc_id": "nvd_21626", "entity_id": "pkg_runc",
+            "cve_id": "CVE-2024-21626", "claim_class": "affected_range",
+            "metric": "affected_range",
+            "version_range": {"intervals": [{"end": {"version": "1.1.11", "inclusive": True}}]},
+            "source_record_kind": "nvd_cpe",
+            "completeness": "complete",
+            "citation": {"quote_span": "runc 1.1.11 and earlier", "location_type": "unknown"},
+        }],
+    }
+    src = "runc 1.1.11 and earlier. ecosystem go. github.com/opencontainers/runc"
+    result, rej = validate_proposal(proposal, src)
+    assert result.claims[0].version_range.intervals[0].end.version == "1.1.11"
+    assert "1.1.11" in result.claims[0].citation.quote_span
+    assert result.entities[0].package.ecosystem == "go"
+    assert result.claims[0].source_record_kind is None
+    assert any(r.kind == "claim_kind" for r in rej)
+
+
+def test_interval_inference_1_1_12_is_gei8_not_golden():
+    """Do not freeze '1.1.12' inferred from '1.1.11 and earlier' as allowed."""
+    pytest.xfail(
+        "GEI-8: version_bound.version '1.1.12' is not in quote/source "
+        "('1.1.11 and earlier'); interval inference is extract_advisory_v1"
+    )
+
+
+def test_cvss_kind_optional_at_pydantic():
+    """kind is ingest-attested: pydantic allows omit; SQL CHECK requires it."""
+    unstamped = m.Claim(
+        claim_id="cv2", doc_id="nvd", entity_id="cve_x",
+        cve_id="CVE-2024-21626", claim_class=m.ClaimClass.cvss,
+        metric="cvss_v3", value=8.6, unit="cvss",
+        completeness=m.Completeness.complete,
+        citation=_cite("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:H"),
+    )
+    assert unstamped.source_record_kind is None
