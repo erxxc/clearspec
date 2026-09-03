@@ -309,6 +309,10 @@ class Claim(BaseModel):
     version_range: VersionRange | None = None
     exploit_status: ExploitStatus | None = None
     workaround_text: Caveat500 | None = None
+    # Ingest-attested (sidecar / CNA-vs-CPE parser), never model-emitted.
+    # validate.py strips proposal values; SQL CHECK requires it for advisory
+    # classes at persist. Pydantic does not require it — the model must not
+    # be the source of this field.
     source_record_kind: SourceRecordKind | None = None
 
     @model_serializer(mode="wrap")
@@ -335,26 +339,18 @@ class Claim(BaseModel):
                     "affected_range/patched_in require a structured version_range; "
                     "quote_span is the verbatim string, not the stored range"
                 )
-            if self.source_record_kind is None:
-                raise ValueError("advisory claims require source_record_kind")
             return self
         if cls == ClaimClass.cvss:
             if self.value is None:
                 raise ValueError("cvss claims require a numeric value")
-            if self.source_record_kind is None:
-                raise ValueError("advisory claims require source_record_kind")
             return self
         if cls == ClaimClass.exploit_status:
             if self.exploit_status is None:
                 raise ValueError("exploit_status claims require exploit_status")
-            if self.source_record_kind is None:
-                raise ValueError("advisory claims require source_record_kind")
             return self
         if cls == ClaimClass.workaround:
             if self.workaround_text is None:
                 raise ValueError("workaround claims require workaround_text")
-            if self.source_record_kind is None:
-                raise ValueError("advisory claims require source_record_kind")
             return self
         return self
 
