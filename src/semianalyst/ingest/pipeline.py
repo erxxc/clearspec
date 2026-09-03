@@ -16,6 +16,11 @@ and a future web UI call these.
 `forget` is the retraction primitive (WS-2a gate, Challenge 1): quarantine a
 doc_id's sidecars + extraction artifacts, then refold the store so no trace of
 the document remains in derived state.
+
+GEI-11: operator ingest accepts advisory JSON/PDF. Kind is attested via
+`attested_kind(doc_type, parser_role)` / KIND_COMPAT only — never copied from
+sidecar or advisory JSON (`source_record_kind` / `ghsa_reviewed` / `cisa_kev`
+/ `nvd_cna` are adversary-controlled). HTTPS-only is N/A on this path.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from typing import TYPE_CHECKING, Callable
 from urllib.parse import urlsplit
 
 from ..config import Config, load_config
+from ..store.attestation import KIND_COMPAT, attested_kind, identity_material
 from .base import (
     SIDECAR_SUFFIX,
     Fetcher,
@@ -50,6 +56,9 @@ if TYPE_CHECKING:  # runtime import lives inside forget() — see the comment th
 # Retracted files move here (under data_dir), never get deleted: an operator can
 # audit what a hostile or wrong document tried to say, or restore it.
 QUARANTINE_DIRNAME = "quarantine"
+
+# doc_types that require operator parser_role and KIND_COMPAT attestation.
+ADVISORY_DOC_TYPES = frozenset(key[0] for key in KIND_COMPAT)
 
 
 @dataclass
@@ -105,6 +114,21 @@ def url_doc_id(url: str) -> str:
     # An empty host+path slug can't happen for a fetchable https URL (the
     # fetcher requires a netloc), but fail toward a valid DocId120 first char.
     return f"{(slug or 'doc')[:_SLUG_MAX]}_{digest}"
+
+
+def identity_doc_id(url: str, kind: str) -> str:
+    """DocId120 derived from identity_material(url, kind).
+
+    NVD CNA and NVD CPE share a URL but hash different material, so they mint
+    two doc_ids. URL alone is never the identity key (no UNIQUE(url)).
+    """
+    digest = hashlib.sha256(identity_material(url, kind)).hexdigest()[:_SLUG_HASH_LEN]
+    parts = urlsplit(url)
+    slug = re.sub(r"[^a-z0-9]+", "_", f"{parts.netloc}{parts.path}".lower()).strip("_")
+    kind_slug = re.sub(r"[^a-z0-9]+", "", kind.lower())
+    suffix = f"_{kind_slug}_{digest}"
+    head = (slug or "doc")[: max(1, 120 - len(suffix))]
+    return f"{head}{suffix}"[:120]
 
 
 def _retracted_doc_ids(config: Config) -> set[str]:
@@ -263,19 +287,38 @@ def ingest_file(
     url: str,
     publish_date: str | None = None,
     ingest_date: str | None = None,
+    parser_role: str | None = None,
 ) -> RawDoc:
     """Store a local file content-addressed and write its provenance sidecar.
 
-    The (doc_type, source_tier, publish_date) fields are recorded verbatim and
-    validated at extract time when the Document is constructed (pydantic) — ingest
-    stays decoupled from the store's model. Returns the stored RawDoc.
+    Operator path (GEI-11): PDF or JSON. Bytes are stored as-is; the file is
+    never parsed for provenance. `source_record_kind` / `ghsa_reviewed` /
+    `cisa_kev` / `nvd_cna` in the file or a hand-edited sidecar are ignored
+    at extract (KIND_COMPAT via doc_type + parser_role only).
+
+    Advisory doc_types require `parser_role` (the ingest discriminator:
+    cna vs cpe, reviewed vs unreviewed, ...). Kind is attested with
+    `attested_kind(doc_type, parser_role)` at ingest so a bad pair fails
+    loud here, not at extract. Sidecar stores doc_type + publisher +
+    parser_role — not model-emitted kind.
 
     Re-ingesting a forgotten doc_id here is the EXPLICIT revival path — a
     deliberate operator act with typed flags. `run_ingest` refuses the implicit
     equivalent (a quarantined doc_id resurfacing via the watchlist); this
-    function deliberately does not.
+    function deliberately does not. Same-bytes rebound to a *different*
+    doc_id is still SidecarCollision.
     """
     content = Path(source_path).read_bytes()
+    if doc_type in ADVISORY_DOC_TYPES:
+        if not parser_role:
+            raise ValueError(
+                "parser_role is required for advisory ingest "
+                "(cna|cpe|catalog|exploit_field|reviewed|unreviewed|json|kev|peer|...)"
+            )
+        attested_kind(doc_type, parser_role)  # fail loud if KIND_COMPAT misses the pair
+    elif parser_role:
+        raise ValueError("parser_role is only valid for advisory doc_types")
+
     raw = store_raw(content, config.paths.raw_dir)
     meta = {
         "doc_id": doc_id,
@@ -288,6 +331,9 @@ def ingest_file(
         "ingest_date": ingest_date or dt.date.today().isoformat(),
         "file_sha256": raw.sha256,
     }
+    if parser_role:
+        meta["parser_role"] = parser_role
+    # Never copy kind from the file. extract uses kind_from_operator_sidecar.
     write_sidecar(config.paths.raw_dir, raw.sha256, meta)
     return RawDoc(sha256=raw.sha256, blob_path=raw.path, meta=meta, is_new=raw.is_new)
 

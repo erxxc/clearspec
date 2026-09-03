@@ -15,7 +15,7 @@ taken from the model: `doc_id` (authoritative context from the Document) and
 from __future__ import annotations
 
 import json
-from typing import Protocol
+from typing import Callable, Protocol
 
 from ..store import models
 from .pdf import pdf_to_text
@@ -24,6 +24,8 @@ from .validate import ExtractionError, ExtractionResult, build_result
 
 DOC_OPEN = "<document_content>"
 DOC_CLOSE = "</document_content>"
+
+_PDF_MAGIC = b"%PDF-"
 
 
 class ModelClient(Protocol):
@@ -71,13 +73,46 @@ class AnthropicModelClient:
 
 
 class ReplayModelClient:
-    """Returns a pre-recorded proposal string. Offline, no network."""
+    """Returns a pre-recorded proposal string. Offline, no network.
 
-    def __init__(self, recorded: str) -> None:
+    `recorded` is either a single JSON proposal string (foundry golden) or a
+    mapping of source-text fingerprint -> proposal string (advisory golden
+    batch). A callable is also accepted so tests can key on document_text.
+    """
+
+    def __init__(
+        self,
+        recorded: str | dict[str, str] | Callable[[str], str],
+    ) -> None:
         self._recorded = recorded
 
     def complete(self, system: str, document_text: str) -> str:
-        return self._recorded
+        rec = self._recorded
+        if callable(rec):
+            return rec(document_text)
+        if isinstance(rec, dict):
+            if document_text in rec:
+                return rec[document_text]
+            for key, val in rec.items():
+                if key and key in document_text:
+                    return val
+            raise ExtractionError("no recorded proposal for this document")
+        return rec
+
+
+def document_text(raw: bytes) -> str:
+    """Operator-fed PDF or JSON/text bytes -> source text for extract.
+
+    JSON is decoded as UTF-8 (the document is DATA, including any
+    self-attested kind fields — those are ignored at the kind stamp, not
+    parsed as provenance). Non-PDF non-UTF8 is a document failure.
+    """
+    if raw.lstrip().startswith(_PDF_MAGIC):
+        return pdf_to_text(raw)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ExtractionError("document is not valid UTF-8 text or PDF") from exc
 
 
 def _parse_proposal(text: str) -> dict:
@@ -95,7 +130,7 @@ def _parse_proposal(text: str) -> dict:
 
 
 class AnthropicExtractor:
-    """raw PDF bytes + versioned prompt -> grounded ExtractionResult."""
+    """raw PDF/JSON bytes + versioned prompt -> grounded ExtractionResult."""
 
     def __init__(self, model_client: ModelClient) -> None:
         self.model_client = model_client
@@ -103,7 +138,7 @@ class AnthropicExtractor:
     def extract(
         self, raw: bytes, document: models.Document, prompt: PromptVersion
     ) -> ExtractionResult:
-        source_text = pdf_to_text(raw)
+        source_text = document_text(raw)
         proposal = _parse_proposal(self.model_client.complete(prompt.text, source_text))
         # doc_id is authoritative context, never a model output — stamp it.
         for claim in proposal.get("claims", []):

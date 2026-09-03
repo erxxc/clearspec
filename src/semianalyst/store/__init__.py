@@ -5,7 +5,7 @@ No other package should import `sqlite3` or write SQL.
 """
 
 from . import models
-from .attestation import KIND_COMPAT, attested_kind, identity_material, kind_from_sidecar, stamp_advisory_claims
+from .attestation import KIND_COMPAT, attested_kind, identity_material, kind_from_operator_sidecar, kind_from_sidecar, stamp_advisory_claims
 from .db import (
     ClaimView,
     StoreNotInitialized,
@@ -32,6 +32,7 @@ __all__ = [
     "KIND_COMPAT",
     "attested_kind",
     "identity_material",
+    "kind_from_operator_sidecar",
     "kind_from_sidecar",
     "stamp_advisory_claims",
     "ClaimView",
