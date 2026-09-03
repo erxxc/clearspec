@@ -96,23 +96,33 @@ def ingest() -> None:
 
 @app.command("ingest-file")
 def ingest_file_cmd(
-    path: str = typer.Argument(..., help="Local file to ingest (e.g. a PDF)."),
+    path: str = typer.Argument(..., help="Local file to ingest (PDF or JSON)."),
     doc_id: str = typer.Option(..., help="Stable id for this document."),
     title: str = typer.Option(...),
     publisher: str = typer.Option(...),
-    doc_type: str = typer.Option(..., help="Schema DocType, e.g. foundry_announcement."),
+    doc_type: str = typer.Option(..., help="Schema DocType, e.g. foundry_announcement or nvd_record."),
     source_tier: int = typer.Option(..., help="1=conference, 2=foundry, 3=vendor."),
     url: str = typer.Option(...),
     publish_date: str = typer.Option(None, help="ISO date the source was published."),
+    parser_role: str = typer.Option(
+        None,
+        help="Ingest discriminator (cna|cpe|reviewed|unreviewed|json|kev|peer|...). "
+             "Required for advisory doc_types. Kind is attested via KIND_COMPAT; "
+             "never copied from the file.",
+    ),
 ) -> None:
     """Ingest a local file (content-addressed) and write its provenance sidecar."""
     try:
         raw = ingest_file(
             load_config(), path, doc_id=doc_id, title=title, publisher=publisher,
-            doc_type=doc_type, source_tier=source_tier, url=url, publish_date=publish_date,
+            doc_type=doc_type, source_tier=source_tier, url=url,
+            publish_date=publish_date, parser_role=parser_role,
         )
     except SidecarCollision as exc:
         # An expected refusal, not a crash — no traceback (UAT A1).
+        typer.echo(f"refused: {_ansi_safe(str(exc))}", err=True)
+        raise typer.Exit(1) from exc
+    except ValueError as exc:
         typer.echo(f"refused: {_ansi_safe(str(exc))}", err=True)
         raise typer.Exit(1) from exc
     suffix = "" if raw.is_new else "  (identical bytes already ingested — no-op)"
