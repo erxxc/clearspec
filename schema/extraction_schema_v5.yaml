@@ -1,0 +1,138 @@
+# Advisory Corroboration — Extraction Schema v5
+# Supersedes nothing. v4 (schema/extraction_schema_v4.yaml) is retained UNEDITED
+# and remains the foundry pack. v5 is a parallel domain pack (GEI-7).
+# Do not edit v1-v4. extract_advisory_v1 is GEI-8; grouping is GEI-9;
+# operator ingest is GEI-11; adversarial precommit is GEI-12.
+#
+# Locked decisions (GEI-6, 2026-09-02):
+#   1. NEVER AUTO-RESOLVE. Conflict is the product. No tier wins a fight.
+#      Tiers weight corroboration (low cannot confirm high) and display order
+#      only. Claims from disagreeing sources COEXIST.
+#   2. Version ranges are a STRUCTURED INTERVAL. quote_span is the verbatim
+#      string. Do not store a range only as a display string.
+#   3. source_tier is CLAIM-CLASS-SPECIFIC, not one document-wide rank.
+#      Document.source_tier stays foundry 1/2/3. Advisory claims carry
+#      source_record_kind (NVD CNA vs NVD CPE even when they share a URL).
+#      Sidecar still stores doc_type + publisher.
+#   4. CVE identity (CVE-2023-44487 vs CVE-2023-39325) is a grouping-key
+#      problem. Key (representable): (cve_id, package_or_product, claim_class).
+#
+# Claim-class source_record_kind ranking (DISPLAY / WEIGHT ONLY):
+#   exploit_status: cisa_kev > vendor_acknowledgement >
+#                   nvd_exploit_field / ghsa_exploit_field > peer_research
+#     KEV with no version range does NOT speak to affected_range.
+#   affected_range / patched_in: ghsa_reviewed (with a range) OR vendor_json /
+#                   vendor_cna > nvd_cna > nvd_cpe > peer_research
+#     Empty/unreviewed GHSA does not outrank vendor.
+#     nvd_cna and nvd_cpe are DIFFERENT records even when they share a URL.
+#   cvss: nvd_catalog > vendor_cvss. Still never auto-resolve.
+#
+# Two-layer bounds (same discipline as v4): pydantic length+charset; SQLite
+# LENGTH CHECKs (migration 0005). Charset patterns are pydantic-only.
+
+document:
+  doc_type: enum    # foundry: foundry_announcement | conference_paper |
+                    #          vendor_whitepaper | product_brief
+                    # advisory: nvd_record | ghsa | vendor_advisory |
+                    #           cisa_kev | researcher_writeup
+  source_tier: enum # foundry [1,2,3] only — not the advisory claim-class rank
+  publisher: string # sidecar field
+
+source_record_kind: enum
+  # nvd_cna | nvd_cpe | nvd_catalog | ghsa_reviewed | ghsa_unreviewed |
+  # vendor_json | vendor_cna | vendor_acknowledgement | vendor_cvss |
+  # cisa_kev | nvd_exploit_field | ghsa_exploit_field | peer_research
+
+entity:
+  entity_type: enum # foundry: process_node | chip | chiplet | package | ip_block
+                    # advisory: cve | package | product | advisory
+                    # `package` is reused: semiconductor vs software distinguished
+                    # by which attribute block is populated (node/chip vs package:)
+  vendor: string
+  name: string
+  aliases: [string]
+  package:                  # citation-grounded when non-null
+    ecosystem: string
+    name: string
+    purl: string?
+    cpe: string?
+  product:
+    name: string
+    ecosystem: string?
+    purl: string?
+    cpe: string?
+  cve:
+    cve_id: string          # identity (CVE-YYYY-NNNNN)
+    cwe: string?            # nullable, citation-grounded
+  attribute_citations: map  # package.* / product.* / cve.cwe plus optional
+                            # identity slots vendor | name | entity_type | cve.cve_id
+
+version_bound:
+  version: string           # <=80, no control chars
+  inclusive: boolean
+
+version_interval:
+  start: version_bound?     # null = unbounded below
+  end: version_bound?       # null = unbounded above
+
+version_range:
+  intervals: [version_interval]  # 1..32; a set, not a display string
+
+claim:
+  claim_id: string
+  doc_id: ref
+  entity_id: ref            # package_or_product (grouping-key component)
+  cve_id: string?           # grouping-key component; null on foundry claims
+  claim_class: enum         # foundry: performance | efficiency | density |
+                            #          power | yield | cost | availability
+                            # advisory: affected_range | patched_in | cvss |
+                            #           exploit_status | workaround
+  metric: string            # NOT the range display string
+  value: number?            # required for foundry + cvss; null for ranges
+  unit: string?
+  version_range: version_range?  # required for affected_range / patched_in
+  exploit_status: enum?     # known_exploited | no_known_exploit | disputed
+  workaround_text: string?
+  source_record_kind: enum? # required for advisory claim_class
+  comparison:
+    is_relative: boolean
+    baseline_entity: entity_id?
+    baseline_stated: boolean
+  conditions:
+    workload: string?
+    precision: string?
+    sparsity: boolean?
+    thermal_config: string?
+    stated_caveats: [string]
+  completeness: enum        # foundry: complete | missing_baseline |
+                            #          missing_conditions | marketing_only
+                            # advisory adds: missing_range | missing_product
+  citation: citation        # quote_span = verbatim string
+  corroboration:            # derived, not persisted (v3 B2)
+
+# Grouping key (representable; comparison is GEI-9):
+#   (claim.cve_id, claim.entity_id, claim.claim_class)
+
+bounds:
+  entity_v5:
+    pkg_ecosystem: {max: 80, no_control_chars: true}
+    pkg_name: {max: 80, no_control_chars: true}
+    pkg_purl: {max: 512, no_control_chars: true, nullable: true}
+    pkg_cpe: {max: 256, no_control_chars: true, nullable: true}
+    product_ecosystem: {max: 80, no_control_chars: true, nullable: true}
+    product_name: {max: 80, no_control_chars: true}
+    product_purl: {max: 512, no_control_chars: true, nullable: true}
+    product_cpe: {max: 256, no_control_chars: true, nullable: true}
+    cve_id: {max: 32, pattern: "^CVE-[0-9]{4}-[0-9]{4,}$"}
+    cve_cwe: {max: 32, pattern: "^CWE-[0-9]{1,8}$", nullable: true}
+  claim_v5:
+    cve_id: {max: 32, pattern: "^CVE-[0-9]{4}-[0-9]{4,}$", nullable: true}
+    version_bound_version: {max: 80, no_control_chars: true}
+    version_range_intervals: {max_items: 32}
+    version_range_json: {max: 40000}
+    workaround_text: {max: 500}
+    source_record_kind: {max: 40}
+    exploit_status: {max: 32}
+
+# CONFLICT (v4) unchanged. Two disagreeing affected_range claims are separate
+# claim rows — they do not collapse via reconcile. That is the product.
