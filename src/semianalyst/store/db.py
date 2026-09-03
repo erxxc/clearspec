@@ -1,11 +1,4 @@
-"""SQLite persistence — the ONLY module in semianalyst permitted to touch the DB.
-
-Everything else calls these functions; no other module imports sqlite3 or writes
-SQL. This boundary is architectural (see CLAUDE.md): it keeps the storage
-representation swappable and confines the nested<->flat mapping to one place.
-
-All writes use parameterized queries. No value is ever interpolated into SQL text.
-"""
+"""SQLite persistence — the ONLY module in semianalyst permitted to touch the DB."""
 
 from __future__ import annotations
 
@@ -19,16 +12,11 @@ from ..config import Config, load_config
 from ..textnorm import CTRL_CLASS, fold
 from . import models
 
-# The schema's per-entity alias ceiling (v4 bounds: max_items 16) — pydantic
-# enforces it per document contribution; the reconcile union enforces it here.
 MAX_ALIASES_PER_ENTITY = 16
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
 
-# --------------------------------------------------------------------------
-# Connection + migration runner
-# --------------------------------------------------------------------------
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -38,7 +26,6 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 def _discover_migrations() -> list[tuple[int, Path]]:
-    """Return (version, path) for every NNNN_*.sql, sorted by numeric prefix."""
     found: list[tuple[int, Path]] = []
     for p in sorted(MIGRATIONS_DIR.glob("[0-9]*.sql")):
         version = int(p.name.split("_", 1)[0])
@@ -58,12 +45,6 @@ def _applied_versions(conn: sqlite3.Connection) -> set[int]:
 
 
 def init_db(config: Config | None = None, *, db_path: Path | None = None) -> Path:
-    """Apply all pending migrations. Idempotent — safe to run repeatedly.
-
-    `db_path` overrides config.paths.db_path: the rebuild fold (extract.run_rebuild)
-    initializes a temp file it later atomically swaps over the configured path;
-    everything else uses the config. Returns the path to the initialized database.
-    """
     if db_path is None:
         config = config or load_config()
         db_path = config.paths.db_path
@@ -73,7 +54,7 @@ def init_db(config: Config | None = None, *, db_path: Path | None = None) -> Pat
         for version, path in _discover_migrations():
             if version in applied:
                 continue
-            with conn:  # one transaction per migration
+            with conn:
                 conn.executescript(path.read_text())
                 conn.execute(
                     "INSERT INTO schema_migrations (version, filename, applied_at) "
@@ -85,9 +66,6 @@ def init_db(config: Config | None = None, *, db_path: Path | None = None) -> Pat
     return db_path
 
 
-# --------------------------------------------------------------------------
-# Serialization helpers (nested pydantic -> flat row)
-# --------------------------------------------------------------------------
 def _d(value: dt.date | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -100,12 +78,6 @@ def _enum(value: object | None) -> object | None:
     return getattr(value, "value", value)
 
 
-# --------------------------------------------------------------------------
-# Inserts (parameterized). Plain INSERT — a duplicate primary key RAISES rather
-# than silently overwriting. Cross-document reconciliation (a later doc naming an
-# entity an earlier doc created) is a deliberate open task for the persistence
-# workstream; until it lands, fail loud instead of clobbering. See CLAUDE.md.
-# --------------------------------------------------------------------------
 def insert_document(conn: sqlite3.Connection, doc: models.Document) -> None:
     conn.execute(
         "INSERT INTO document"
@@ -124,8 +96,9 @@ def insert_document(conn: sqlite3.Connection, doc: models.Document) -> None:
 def insert_entity(conn: sqlite3.Connection, ent: models.Entity) -> None:
     node = ent.node or models.NodeAttributes()
     chip = ent.chip or models.ChipAttributes()
-    # v2: attribute-path -> citation, serialized as a JSON map (mode="json"
-    # renders the LocationType enum + int page as JSON scalars).
+    pkg = ent.package
+    product = ent.product
+    cve = ent.cve
     attr_cites = {
         path: cite.model_dump(mode="json") for path, cite in ent.attribute_citations.items()
     }
@@ -136,8 +109,11 @@ def insert_entity(conn: sqlite3.Connection, ent: models.Entity) -> None:
         " node_hvm_date_claimed, node_hvm_date_actual, "
         " chip_process_node_ref, chip_transistor_count_b, chip_die_size_mm2, "
         " chip_package_type, chip_memory_type, chip_memory_bw_gbps, chip_tdp_w, "
-        " chip_launch_date, attribute_citations) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " chip_launch_date, attribute_citations, "
+        " pkg_ecosystem, pkg_name, pkg_purl, pkg_cpe, "
+        " product_ecosystem, product_name, product_purl, product_cpe, "
+        " cve_id, cve_cwe) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             ent.entity_id, _enum(ent.entity_type), ent.vendor, ent.name,
             json.dumps(ent.aliases),
@@ -147,23 +123,34 @@ def insert_entity(conn: sqlite3.Connection, ent: models.Entity) -> None:
             chip.process_node_ref, chip.transistor_count_b, chip.die_size_mm2,
             chip.package_type, chip.memory_type, chip.memory_bw_gbps, chip.tdp_w,
             _d(chip.launch_date), json.dumps(attr_cites),
+            None if pkg is None else pkg.ecosystem,
+            None if pkg is None else pkg.name,
+            None if pkg is None else pkg.purl,
+            None if pkg is None else pkg.cpe,
+            None if product is None else product.ecosystem,
+            None if product is None else product.name,
+            None if product is None else product.purl,
+            None if product is None else product.cpe,
+            None if cve is None else cve.cve_id,
+            None if cve is None else cve.cwe,
         ),
     )
 
 
 def insert_claim(conn: sqlite3.Connection, claim: models.Claim) -> None:
     c = claim
-    # The claim's corroboration verdict is NOT persisted (v3 / decision B2): it is a
-    # per-group fact analyze derives on read, not a property of the stored row. The
-    # store deliberately holds no corr_status column — read the AnalysisReport.
+    version_range_json = None
+    if c.version_range is not None:
+        version_range_json = json.dumps(c.version_range.model_dump(mode="json"))
     conn.execute(
         "INSERT INTO claim"
         "(claim_id, doc_id, entity_id, claim_class, metric, value, unit, "
         " cmp_is_relative, cmp_baseline_entity, cmp_baseline_stated, "
         " cond_workload, cond_precision, cond_sparsity, cond_thermal_config, "
         " cond_stated_caveats, completeness, cite_page, cite_quote_span, "
-        " cite_location_type) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " cite_location_type, cve_id, source_record_kind, version_range, "
+        " exploit_status, workaround_text) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             c.claim_id, c.doc_id, c.entity_id, _enum(c.claim_class), c.metric,
             c.value, c.unit,
@@ -173,15 +160,13 @@ def insert_claim(conn: sqlite3.Connection, claim: models.Claim) -> None:
             _b(c.conditions.sparsity), c.conditions.thermal_config,
             json.dumps(c.conditions.stated_caveats), _enum(c.completeness),
             c.citation.page, c.citation.quote_span, _enum(c.citation.location_type),
+            c.cve_id, _enum(c.source_record_kind), version_range_json,
+            _enum(c.exploit_status), c.workaround_text,
         ),
     )
 
 
 def insert_conflict(conn: sqlite3.Connection, conflict: models.Conflict) -> None:
-    """Persist a reconciliation-refusal record (v4, 2026-08-18 gate, Conflict 1).
-    `conflict_id` is assigned by AUTOINCREMENT and `created_at` is stamped here
-    (UTC ISO) — the store owns the clock, exactly like migration timestamps; the
-    model's `created_at` field is populated on read, never trusted on write."""
     conn.execute(
         "INSERT INTO entity_conflict"
         "(kind, entity_id, doc_id, field, stored_value, offered_value, created_at) "
@@ -194,9 +179,6 @@ def insert_conflict(conn: sqlite3.Connection, conflict: models.Conflict) -> None
     )
 
 
-# --------------------------------------------------------------------------
-# Read helpers (used by analyze/ and the `report` command)
-# --------------------------------------------------------------------------
 def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
     tables = ("document", "entity", "claim", "entity_conflict", "macro_snapshot")
     try:
@@ -206,27 +188,14 @@ def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
 
 
 def stored_doc_shas(conn: sqlite3.Connection) -> dict[str, str]:
-    """doc_id -> file_sha256 for every persisted Document. `run_extract` uses this
-    to classify each ingested sidecar: an unknown doc_id is pending; the same
-    doc_id AND the same file_sha256 is already extracted (an honest idempotent
-    skip); the same doc_id with a DIFFERENT file_sha256 is a silent source revision
-    (the schema's `file_sha256` exists precisely to detect this) — surfaced loudly,
-    never skipped. Same-doc_id re-extraction/supersession is deferred (see
-    CLAUDE.md); the guarantee here is that a revision is never silently dropped."""
     try:
         rows = conn.execute("SELECT doc_id, file_sha256 FROM document").fetchall()
     except sqlite3.OperationalError as exc:
         raise _translate_missing_schema(exc) from exc
-    return {
-        row["doc_id"]: row["file_sha256"]
-        for row in rows
-    }
+    return {row["doc_id"]: row["file_sha256"] for row in rows}
 
 
 def get_conflicts(conn: sqlite3.Connection) -> list[models.Conflict]:
-    """Every persisted reconciliation-refusal record, in insertion order. The
-    values are ADVERSARY-AUTHORED text (see models.Conflict) — display sites must
-    route them through the hardened sanitizer; this reader does not."""
     rows = conn.execute(
         "SELECT conflict_id, kind, entity_id, doc_id, field, stored_value, "
         "       offered_value, created_at "
@@ -243,8 +212,6 @@ def get_conflicts(conn: sqlite3.Connection) -> list[models.Conflict]:
 
 
 def conflict_counts_by_entity(conn: sqlite3.Connection) -> dict[str, int]:
-    """entity_id -> number of recorded conflicts — the cheap summary `report`
-    surfaces next to each entity (the CLI wiring is the report workstream's)."""
     return {
         row["entity_id"]: row["n"]
         for row in conn.execute(
@@ -259,30 +226,27 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ClaimView:
-    """A read-only claim projection joined to its document's source_tier and
-    publisher — exactly what analyze needs, without reconstructing the full
-    nested Claim model."""
-
     claim_id: str
     doc_id: str
     entity_id: str
     metric: str
-    value: float
+    value: float | None
     unit: str
     is_relative: bool
     baseline_entity: str | None
     sparsity: bool | None
     completeness: str
     source_tier: int
-    # Joined from document like source_tier (WS-2a: H1's publisher-diversity
-    # floor reads it). Defaulted only so pre-v4 direct construction stays valid;
-    # get_claims_for_analysis always populates it.
     publisher: str = ""
+    claim_class: str = ""
+    source_record_kind: str | None = None
+    cve_id: str | None = None
+
+    def advisory_group_key(self) -> tuple[str, str, str]:
+        """GEI-9 grouping key, representation only — never a resolver."""
+        return (self.cve_id or "", self.entity_id, self.claim_class)
 
 
-# Column -> getter maps for read-compare-write reconciliation. The getters
-# serialize exactly like insert_entity (dates -> ISO, bools -> 0/1, enums ->
-# value), so comparisons happen on the STORED representation.
 _NODE_COLS = {
     "node_density_mtx_mm2": lambda n: n.density_mtx_mm2,
     "node_transistor_type": lambda n: _enum(n.transistor_type),
@@ -300,33 +264,49 @@ _CHIP_COLS = {
     "chip_tdp_w": lambda c: c.tdp_w,
     "chip_launch_date": lambda c: _d(c.launch_date),
 }
+_PKG_COLS = {
+    "pkg_ecosystem": lambda p: None if p is None else p.ecosystem,
+    "pkg_name": lambda p: None if p is None else p.name,
+    "pkg_purl": lambda p: None if p is None else p.purl,
+    "pkg_cpe": lambda p: None if p is None else p.cpe,
+}
+_PRODUCT_COLS = {
+    "product_ecosystem": lambda p: None if p is None else p.ecosystem,
+    "product_name": lambda p: None if p is None else p.name,
+    "product_purl": lambda p: None if p is None else p.purl,
+    "product_cpe": lambda p: None if p is None else p.cpe,
+}
+_CVE_COLS = {
+    "cve_id": lambda c: None if c is None else c.cve_id,
+    "cve_cwe": lambda c: None if c is None else c.cwe,
+}
 
+_COL_PATH = {
+    **{col: col.replace("_", ".", 1) for col in list(_NODE_COLS) + list(_CHIP_COLS)},
+    "pkg_ecosystem": "package.ecosystem",
+    "pkg_name": "package.name",
+    "pkg_purl": "package.purl",
+    "pkg_cpe": "package.cpe",
+    "product_ecosystem": "product.ecosystem",
+    "product_name": "product.name",
+    "product_purl": "product.purl",
+    "product_cpe": "product.cpe",
+    "cve_id": "cve.cve_id",
+    "cve_cwe": "cve.cwe",
+}
 
-# Identity fields are frozen by the FIRST document that creates the entity —
-# never overwritten, no tier exception (K1). Case-folded comparison: cross-doc
-# casing ("TSMC"/"Tsmc") is the same identity, not a conflict.
 _IDENTITY_COLS = ("vendor", "name", "entity_type")
 
 
 def _conflict_repr(value: object) -> str:
-    """Stringify a stored/offered value for a conflict record: dates/bools/floats
-    via str() on the stored representation, control bytes scrubbed, truncated to
-    the 120-char bound the Conflict model and the entity_conflict DDL both
-    enforce. The scrub is load-bearing (appsec, 2026-08-18): a legacy/poisoned
-    stored value carrying a control byte would otherwise fail Conflict's
-    Text120 pattern and raise from INSIDE reconcile — aborting the whole
-    document instead of recording the refusal."""
     return _CTRL_RE.sub(" ", str(value))[:120]
 
 
-_CTRL_RE = re.compile(CTRL_CLASS)  # shared CLASS, local scrub semantics (textnorm)
+_CTRL_RE = re.compile(CTRL_CLASS)
 
 
 class StoreNotInitialized(RuntimeError):
-    """The DB file exists (or was just created by connect) but carries no
-    schema — `semianalyst db init` has not been run. Raised instead of a raw
-    sqlite OperationalError so the CLI can guide the operator without importing
-    sqlite3 (store is the sole SQLite owner)."""
+    """The DB file exists but carries no schema."""
 
 
 def _translate_missing_schema(exc: sqlite3.OperationalError) -> Exception:
@@ -336,9 +316,6 @@ def _translate_missing_schema(exc: sqlite3.OperationalError) -> Exception:
 
 
 def _foreign_surface_forms(conn: sqlite3.Connection, entity_id: str) -> set[str]:
-    """Every OTHER entity's surface forms (name + aliases), folded via the
-    SHARED textnorm.fold — one query; the store is small enough that a full
-    scan per reconcile is fine."""
     foreign: set[str] = set()
     for row in conn.execute(
         "SELECT name, aliases FROM entity WHERE entity_id != ?", (entity_id,)
@@ -356,39 +333,17 @@ def _refusal(
         kind=kind, entity_id=entity_id, doc_id=doc_id, field=field,
         stored_value=None if stored is None else _conflict_repr(stored),
         offered_value=_conflict_repr(offered),
-        created_at="",  # store-stamped at insert (like conflict_id)
+        created_at="",
     )
 
 
 def reconcile_entity(conn: sqlite3.Connection, ent: models.Entity, doc_id: str) -> None:
-    """Insert a new entity, or merge a later document's re-description into an
-    existing one — read-compare-write (2026-08-18 gate: Conflict 1, K1/K2, G3).
-
-    The merge NEVER overwrites, no tier exception. What it refuses to apply is
-    persisted as a Conflict naming the offending `doc_id` — the offered value has
-    no other home; reconcile drops it at refusal time:
-      - identity fields (vendor/name/entity_type): frozen by the first document;
-        a case-folded difference is recorded as `identity_field` (case-only
-        variation is the same identity, not a conflict);
-      - node/chip attributes: a stored NULL is filled from the newcomer, and the
-        attribute's citation moves WITH the value (never one without the other);
-        a differing non-null value is recorded as `attribute` under its schema
-        path (e.g. 'node.transistor_type'); an equal re-offer is a no-op;
-      - aliases (G3): unioned, EXCEPT an alias that equals (case-insensitive)
-        ANOTHER stored entity's name or alias — refused as `alias_collision`.
-        This applies on BOTH paths — merge AND first insert — so neither a later
-        doc nor a freshly minted entity can capture a competitor's surface form
-        (the entity's own shape-validated name is exempt on insert).
+    """Insert or merge. NEVER overwrites; no tier exception. Advisory package /
+    product / cve attributes follow the same K1/K2 never-overwrite as node/chip.
+    No path picks a winning source_record_kind — that lives on claims, not here.
     """
     existing = conn.execute("SELECT * FROM entity WHERE entity_id = ?", (ent.entity_id,)).fetchone()
     if existing is None:
-        # G3 applies to the INSERT path too (hostile-suite finding, 2026-08-18):
-        # a NEW entity must not capture another entity's surface form as an
-        # alias any more than a merge may. The entity's OWN shape-validated
-        # `name` is exempt (the pinned-name invariant — an identity-level
-        # name squat is the J/identity domain, not alias filtering). Refused
-        # aliases become alias_collision conflicts AFTER the insert (the
-        # conflict row FK-references the entity).
         foreign = _foreign_surface_forms(conn, ent.entity_id)
         kept: list[str] = []
         refused: list[str] = []
@@ -404,61 +359,56 @@ def reconcile_entity(conn: sqlite3.Connection, ent: models.Entity, doc_id: str) 
                 "alias", None, alias))
         return
 
-    # --- identity fields: compare case-folded; first writer wins (K1) ---
     for col in _IDENTITY_COLS:
         offered = _enum(getattr(ent, col))
-        # SHARED fold, not bare casefold: PDF text-layer noise ("TSMC " with a
-        # trailing space) is the same identity, never a spurious conflict.
         if fold(str(offered)) != fold(str(existing[col])):
             insert_conflict(conn, _refusal(
                 models.ConflictKind.identity_field, ent.entity_id, doc_id,
                 col, existing[col], offered))
 
-    # --- node/chip attributes: fill NULLs (value + citation as a pair), record
-    # --- a differing non-null as a conflict, never overwrite (K1/K2) ---
     attr_cites = json.loads(existing["attribute_citations"])
     node = ent.node or models.NodeAttributes()
     chip = ent.chip or models.ChipAttributes()
     set_cols: list[str] = []
     params: list[object] = []
-    for col, getter in list(_NODE_COLS.items()) + list(_CHIP_COLS.items()):
-        offered = getter(node if col.startswith("node_") else chip)
-        if offered is None:
-            continue
-        stored = existing[col]
-        if stored is None:
-            set_cols.append(f"{col} = ?")
-            params.append(offered)
-            # The citation union is scoped to values actually filled — a merged
-            # citation must never point at a value its document didn't supply.
-            path = col.replace("_", ".", 1)  # node_transistor_type -> node.transistor_type
-            if path in ent.attribute_citations:
-                attr_cites[path] = ent.attribute_citations[path].model_dump(mode="json")
-        elif stored != offered:
-            insert_conflict(conn, _refusal(
-                models.ConflictKind.attribute, ent.entity_id, doc_id,
-                col.replace("_", ".", 1), stored, offered))
 
-    # --- aliases: union, refusing cross-entity collisions (G3) and enforcing
-    # --- the schema's per-entity ceiling at the true point of accumulation ---
+    attr_groups = [
+        (_NODE_COLS, node),
+        (_CHIP_COLS, chip),
+        (_PKG_COLS, ent.package),
+        (_PRODUCT_COLS, ent.product),
+        (_CVE_COLS, ent.cve),
+    ]
+    for col_map, obj in attr_groups:
+        for col, getter in col_map.items():
+            offered = getter(obj)
+            if offered is None:
+                continue
+            stored = existing[col]
+            path = _COL_PATH[col]
+            if stored is None:
+                set_cols.append(f"{col} = ?")
+                params.append(offered)
+                if path in ent.attribute_citations:
+                    attr_cites[path] = ent.attribute_citations[path].model_dump(mode="json")
+            elif stored != offered:
+                insert_conflict(conn, _refusal(
+                    models.ConflictKind.attribute, ent.entity_id, doc_id,
+                    path, stored, offered))
+
     aliases = json.loads(existing["aliases"])
     if ent.aliases:
         foreign = _foreign_surface_forms(conn, ent.entity_id)
-        have = {fold(a) for a in aliases}  # folded membership: a case/space variant is a re-offer
+        have = {fold(a) for a in aliases}
         for alias in ent.aliases:
             f = fold(alias)
             if f in have:
-                continue  # already unioned — an equal re-offer, not a conflict
+                continue
             if f in foreign:
                 insert_conflict(conn, _refusal(
                     models.ConflictKind.alias_collision, ent.entity_id, doc_id,
                     "alias", None, alias))
             elif len(aliases) >= MAX_ALIASES_PER_ENTITY:
-                # The schema's 16-item bound is a PER-ENTITY invariant; pydantic
-                # only sees one document's contribution, so the union here is
-                # the real enforcement point. Refuse the alias — never the
-                # document (a fail-closed DDL under a fail-soft model layer is
-                # the posture inversion the precommit gate rejected).
                 insert_conflict(conn, _refusal(
                     models.ConflictKind.alias_overflow, ent.entity_id, doc_id,
                     "alias", None, alias))
@@ -472,7 +422,6 @@ def reconcile_entity(conn: sqlite3.Connection, ent: models.Entity, doc_id: str) 
 
 
 def get_entities_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
-    """entity_id -> aliases, for every reconciled entity in the store."""
     return {
         row["entity_id"]: json.loads(row["aliases"])
         for row in conn.execute("SELECT entity_id, aliases FROM entity")
@@ -480,8 +429,6 @@ def get_entities_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
 
 
 def get_entities_for_analysis(conn: sqlite3.Connection) -> list[dict]:
-    """Read-only identity projection for analyze's advisory checks (J slug
-    collisions): entity_id, entity_type, vendor, name, aliases (decoded)."""
     return [
         {
             "entity_id": r["entity_id"], "entity_type": r["entity_type"],
@@ -496,12 +443,12 @@ def get_entities_for_analysis(conn: sqlite3.Connection) -> list[dict]:
 
 
 def get_claims_for_analysis(conn: sqlite3.Connection) -> list[ClaimView]:
-    """Every claim, joined to its document's source_tier and publisher."""
     try:
         rows = conn.execute(
             "SELECT c.claim_id, c.doc_id, c.entity_id, c.metric, c.value, c.unit, "
             "       c.cmp_is_relative, c.cmp_baseline_entity, c.cond_sparsity, "
-            "       c.completeness, d.source_tier, d.publisher "
+            "       c.completeness, d.source_tier, d.publisher, "
+            "       c.claim_class, c.source_record_kind, c.cve_id "
             "FROM claim c JOIN document d ON c.doc_id = d.doc_id"
         ).fetchall()
     except sqlite3.OperationalError as exc:
@@ -509,20 +456,21 @@ def get_claims_for_analysis(conn: sqlite3.Connection) -> list[ClaimView]:
     return [
         ClaimView(
             claim_id=r["claim_id"], doc_id=r["doc_id"], entity_id=r["entity_id"],
-            metric=r["metric"], value=r["value"], unit=r["unit"],
+            metric=r["metric"], value=r["value"], unit=r["unit"] or "",
             is_relative=bool(r["cmp_is_relative"]),
             baseline_entity=r["cmp_baseline_entity"],
             sparsity=None if r["cond_sparsity"] is None else bool(r["cond_sparsity"]),
             completeness=r["completeness"], source_tier=int(r["source_tier"]),
             publisher=r["publisher"],
+            claim_class=r["claim_class"],
+            source_record_kind=r["source_record_kind"],
+            cve_id=r["cve_id"],
         )
         for r in rows
     ]
 
 
 def report_counts(config: Config | None = None) -> dict[str, int]:
-    """Row counts per table. The library entry point behind `semianalyst report`
-    (and a future web UI) — callers never open a connection themselves."""
     config = config or load_config()
     conn = connect(config.paths.db_path)
     try:
