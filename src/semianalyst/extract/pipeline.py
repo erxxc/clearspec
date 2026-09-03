@@ -19,6 +19,11 @@ EXTRACTED and folded in, retiring the WS-1 deferral) and retraction in
 The Extractor is injectable so the full pipeline runs offline (ReplayModelClient,
 no network, no API key) in tests; the default builds the real Anthropic client,
 which is exercised by the @live E2E test — the ENFORCE anchor for the wiring.
+
+GEI-11: advisory docs use extract_advisory_v1 (not the foundry prompt). Kind is
+stamped via attested_kind(doc_type, parser_role) / kind_from_operator_sidecar —
+never kind_from_sidecar (that path copies source_record_kind and bypasses
+KIND_COMPAT).
 """
 
 from __future__ import annotations
@@ -39,9 +44,10 @@ from ..ingest import (
     write_extraction_artifact,
 )
 from ..store import models
+from ..store.attestation import kind_from_operator_sidecar
 from ..textnorm import CTRL_CLASS
 from .base import AnthropicExtractor, AnthropicModelClient
-from .prompts import PromptVersion
+from .prompts import PromptVersion, prompt_name_for_doc_type
 from .validate import ExtractionResult
 
 _ERR_CTRL = re.compile(CTRL_CLASS)  # shared CLASS, local scrub semantics (textnorm)
@@ -154,23 +160,38 @@ def run_extract(config: Config | None = None, *, extractor: AnthropicExtractor |
                 note = "no pending raw docs — ingest one with `semianalyst ingest-file`."
             return ExtractReport(skipped=skipped, errors=errors, note=note)
 
-        prompt = PromptVersion.load(config.model.prompt_version)
         # Build the real Anthropic extractor only when there is work AND no client
         # was injected — so `extract` with nothing pending never needs an API key.
         extractor = extractor or AnthropicExtractor(AnthropicModelClient(config.model.name))
+        prompt_cache: dict[str, PromptVersion] = {}
+
+        def _prompt_for(doc_type: str) -> PromptVersion:
+            name = prompt_name_for_doc_type(doc_type, config.model.prompt_version)
+            if name not in prompt_cache:
+                prompt_cache[name] = PromptVersion.load(name)
+            return prompt_cache[name]
 
         extracted: list[str] = []
         revised: list[str] = []
         for rd, is_revision in pending:
             doc_id = rd.meta.get("doc_id", rd.sha256)
             try:
+                prompt = _prompt_for(rd.meta.get("doc_type", ""))
                 document = _build_document(rd.meta, config.model.name, prompt)
                 result = extractor.extract(rd.blob_path.read_bytes(), document, prompt)
+                # Kind is ingest-attested via KIND_COMPAT only. A sidecar
+                # source_record_kind field is ignored as adversary-controlled.
+                kind = kind_from_operator_sidecar(rd.meta)
                 if is_revision:
                     # The doc_id row already exists under older bytes — a direct
                     # persist would fail loud on the duplicate INSERT. Retain the
                     # artifact only; the refold below replaces the store wholesale
                     # so it reflects exactly this latest revision.
+                    if kind is not None:
+                        result = ExtractionResult(
+                            entities=result.entities,
+                            claims=store.stamp_advisory_claims(result.claims, kind),
+                        )
                     write_extraction_artifact(
                         config.paths.raw_dir, rd.sha256,
                         _artifact_payload(document, result, config.model.name, prompt),
@@ -181,10 +202,19 @@ def run_extract(config: Config | None = None, *, extractor: AnthropicExtractor |
                     # happened; commit the persisted rows atomically or roll this
                     # doc back — the next doc is unaffected.
                     with conn:
-                        store.persist_extraction(conn, document, result.entities, result.claims)
+                        store.persist_extraction(
+                            conn, document, result.entities, result.claims,
+                            source_record_kind=kind,
+                        )
                     # Artifact AFTER a successful persist: what the store accepted
-                    # is what a rebuild will replay. The store is derived state;
-                    # the artifact + sidecar are the durable record.
+                    # is what a rebuild will replay. Stamp kind onto the artifact
+                    # so a refold does not re-derive from a (possibly poisoned)
+                    # sidecar source_record_kind field.
+                    if kind is not None:
+                        result = ExtractionResult(
+                            entities=result.entities,
+                            claims=store.stamp_advisory_claims(result.claims, kind),
+                        )
                     write_extraction_artifact(
                         config.paths.raw_dir, rd.sha256,
                         _artifact_payload(document, result, config.model.name, prompt),
