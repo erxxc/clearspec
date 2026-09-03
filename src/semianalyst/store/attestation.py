@@ -85,12 +85,37 @@ def identity_material(url: str, source_record_kind: str | None = None) -> bytes:
 
 
 def kind_from_sidecar(meta: dict) -> models.SourceRecordKind | None:
-    """Read ingest-attested kind from a provenance sidecar dict.
+    """DO NOT use on the operator ingest path (GEI-11).
 
-    Extract stamps this onto advisory claims; the model proposal is ignored.
-    Missing/empty means foundry (no kind). GEI-11 writes this field.
+    Reads meta['source_record_kind'] and BYPASSES KIND_COMPAT. A sidecar or
+    advisory JSON that self-attests ghsa_reviewed / cisa_kev / nvd_cna would
+    launder that kind as if ingest had attested it. Operator ingest stamps
+    via `kind_from_operator_sidecar` (doc_type + parser_role through
+    KIND_COMPAT only) and ignores these fields as adversary-controlled.
     """
     raw = meta.get("source_record_kind")
     if not raw:
         return None
     return models.SourceRecordKind(raw)
+
+
+def kind_from_operator_sidecar(meta: dict) -> models.SourceRecordKind | None:
+    """Stamp kind ONLY via KIND_COMPAT(doc_type, parser_role).
+
+    Sidecar still stores doc_type + publisher (PRD) plus operator parser_role.
+    `source_record_kind` / `ghsa_reviewed` / `cisa_kev` / `nvd_cna` on the
+    sidecar or in the ingested JSON are ignored — never copied, never used
+    as identity. Foundry (doc_type not in KIND_COMPAT) returns None.
+    """
+    doc_type = meta.get("doc_type")
+    if not doc_type:
+        return None
+    dt = getattr(doc_type, "value", doc_type)
+    if dt not in {key[0] for key in KIND_COMPAT}:
+        return None
+    parser_role = meta.get("parser_role")
+    if not parser_role:
+        raise ValueError(
+            f"advisory sidecar for doc_type={dt!r} missing operator parser_role"
+        )
+    return attested_kind(dt, parser_role)

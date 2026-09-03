@@ -21,9 +21,11 @@ from .base import (
 from .fetch import FetchedDoc, FetchError, fetch_url, looks_like_pdf
 from .foundry import FoundryFetcher
 from .pipeline import (
+    ADVISORY_DOC_TYPES,
     ForgetReport,
     IngestReport,
     forget,
+    identity_doc_id,
     ingest_file,
     run_ingest,
     url_doc_id,
@@ -53,7 +55,9 @@ __all__ = [
     "FoundryFetcher",
     "ForgetReport",
     "IngestReport",
+    "ADVISORY_DOC_TYPES",
     "forget",
+    "identity_doc_id",
     "ingest_file",
     "run_ingest",
     "url_doc_id",

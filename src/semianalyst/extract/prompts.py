@@ -20,6 +20,26 @@ from ..config import REPO_ROOT
 
 PROMPTS_DIR = REPO_ROOT / "prompts"
 
+# Operator-ingest advisory doc_types (GEI-11). These select extract_advisory_v1
+# rather than the foundry prompt. Adding a type here without a KIND_COMPAT row
+# is not enough — ingest still attests kind via attested_kind.
+ADVISORY_DOC_TYPES = frozenset({
+    "nvd_record",
+    "ghsa",
+    "vendor_advisory",
+    "cisa_kev",
+    "researcher_writeup",
+})
+ADVISORY_PROMPT = "extract_advisory_v1"
+
+
+def prompt_name_for_doc_type(doc_type: str, default: str) -> str:
+    """Per-document prompt selection. Advisory docs never use the foundry prompt."""
+    dt = getattr(doc_type, "value", doc_type)
+    if dt in ADVISORY_DOC_TYPES:
+        return ADVISORY_PROMPT
+    return default
+
 
 @dataclass(frozen=True)
 class PromptVersion:
