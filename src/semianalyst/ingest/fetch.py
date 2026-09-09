@@ -18,6 +18,8 @@ public surface would be a production backdoor dressed as a fixture).
 
 from __future__ import annotations
 
+import json
+
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -93,6 +95,28 @@ def looks_like_pdf(content: bytes) -> bool:
     not-PDF document is a distinct, precisely-nameable per-document refusal,
     not a transport failure — callers (FoundryFetcher) report it as such."""
     return content.startswith(b"%PDF-")
+
+
+def looks_like_json(content: bytes) -> bool:
+    """JSON-shape check, deliberately separate from transport (mirrors
+    looks_like_pdf). Accepts UTF-8 objects/arrays only — HTML, PDF, and
+    arbitrary binary are refused before storage. A Content-Type header is
+    never trusted alone: the body must parse as JSON.
+    """
+    if content.startswith(b"%PDF-"):
+        return False
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    stripped = text.lstrip()
+    if not stripped or stripped[0] not in "{[":
+        return False
+    try:
+        json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return True
 
 
 def _read_capped(resp, max_bytes: int, url: str) -> bytes:

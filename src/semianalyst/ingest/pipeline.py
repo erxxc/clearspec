@@ -21,6 +21,12 @@ GEI-11: operator ingest accepts advisory JSON/PDF. Kind is attested via
 `attested_kind(doc_type, parser_role)` / KIND_COMPAT only — never copied from
 sidecar or advisory JSON (`source_record_kind` / `ghsa_reviewed` / `cisa_kev`
 / `nvd_cna` are adversary-controlled). HTTPS-only is N/A on this path.
+
+GEI-14: curated NVD/GHSA/CISA KEV JSON URLs on the watchlist use the same
+WS-2b fetch policy (HTTPS-only hops, caps) via WatchlistFetcher /
+AdvisoryJsonFetcher. Sidecar gets parser_role; identity uses identity_doc_id
+so NVD CNA vs CPE stay distinct. source_record_kind is never written to the
+sidecar — extract stamps via attested_kind. HTML discovery stays deferred.
 """
 
 from __future__ import annotations
@@ -49,6 +55,7 @@ from .base import (
     write_sidecar,
 )
 from .foundry import FoundryFetcher
+from .watchlist import WatchlistFetcher
 
 if TYPE_CHECKING:  # runtime import lives inside forget() — see the comment there
     from ..extract.pipeline import RebuildReport
@@ -187,8 +194,8 @@ def run_ingest(
     >= 1 (a single in-flight request never exceeds a concurrency budget).
     `sleeper` is injectable so tests record the pacing instead of sleeping.
 
-    Fault isolation mirrors ExtractReport: a FetchError, a non-PDF magic
-    refusal, or a SidecarCollision lands in `errors` and the batch continues.
+    Fault isolation mirrors ExtractReport: a FetchError, a non-PDF / non-JSON
+    magic refusal, or a SidecarCollision lands in `errors` and the batch continues.
 
     A changed-bytes re-fetch of a known URL needs NO special handling here:
     store_raw content-addresses the new bytes as a new blob, the sidecar binds
@@ -196,7 +203,7 @@ def run_ingest(
     revision path (extract + refold supersession) does the rest.
     """
     config = config or load_config()
-    fetcher = fetcher or FoundryFetcher()
+    fetcher = fetcher or WatchlistFetcher()
     report = IngestReport()
     retracted = _retracted_doc_ids(config)
 
@@ -218,10 +225,23 @@ def run_ingest(
             # index-page url has nothing fetchable until WS-3's HTML discovery.
             report.skipped.append(source.name)
             continue
+        # Advisory JSON sources require parser_role (GEI-14 / GEI-11). Fail
+        # the source's documents loud rather than writing an un-attestable sidecar.
+        if source.doc_type in ADVISORY_DOC_TYPES and not source.parser_role:
+            for url in source.documents:
+                report.errors.append((
+                    url,
+                    "parser_role is required for advisory JSON ingest "
+                    f"(doc_type={source.doc_type!r})",
+                ))
+            continue
+        if source.doc_type in ADVISORY_DOC_TYPES:
+            # Fail loud early if KIND_COMPAT misses the pair.
+            attested_kind(source.doc_type, source.parser_role)
         ref = SourceRef(
             name=source.name, url=source.url, doc_type=source.doc_type,
             source_tier=source.source_tier, publisher=source.publisher,
-            documents=source.documents,
+            documents=source.documents, parser_role=source.parser_role,
         )
         for outcome in fetcher.fetch(ref, config.paths.raw_dir, pace=pace):
             if outcome.error is not None:
@@ -229,7 +249,11 @@ def run_ingest(
                 # error's presence alone is decisive here.
                 report.errors.append((outcome.requested_url, outcome.error))
                 continue
-            doc_id = url_doc_id(outcome.requested_url)
+            if source.doc_type in ADVISORY_DOC_TYPES:
+                kind = attested_kind(source.doc_type, source.parser_role)
+                doc_id = identity_doc_id(outcome.requested_url, kind.value)
+            else:
+                doc_id = url_doc_id(outcome.requested_url)
             if doc_id in retracted:
                 # Refuse implicit revival of a forgotten document (see
                 # _retracted_doc_ids). The fetched bytes stay content-addressed
@@ -250,12 +274,15 @@ def run_ingest(
                 "doc_type": source.doc_type,
                 "source_tier": source.source_tier,
                 # The FINAL post-redirect URL, recorded for audit; identity
-                # stays keyed on the requested URL (url_doc_id above).
+                # stays keyed on the requested URL (url_doc_id / identity_doc_id).
                 "url": outcome.final_url,
                 "publish_date": None,  # unknown — never guessed from untrusted headers
                 "ingest_date": today,
                 "file_sha256": outcome.raw.sha256,
             }
+            if source.parser_role:
+                meta["parser_role"] = source.parser_role
+            # NEVER write source_record_kind — extract stamps via attested_kind.
             try:
                 write_sidecar(config.paths.raw_dir, outcome.raw.sha256, meta)
             except SidecarCollision as exc:

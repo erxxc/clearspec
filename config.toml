@@ -46,3 +46,40 @@ url         = "https://www.intel.com/content/www/us/en/newsroom/home.html"
 doc_type    = "foundry_announcement"
 source_tier = 2
 # documents = ["https://www.intel.com/content/dam/www/central-libraries/us/en/documents/<file>.pdf"]  # explicit URLs until WS-3 discovery
+
+
+# ---------------------------------------------------------------------------
+# GEI-14 curated advisory JSON sources (NVD API / GHSA / CISA KEV).
+# Explicit document URLs only — no HTML discovery / vendor pages.
+# parser_role mapping (attested via KIND_COMPAT; never written as kind):
+#   nvd_record + cna|cpe|catalog|exploit_field
+#   ghsa       + reviewed|unreviewed|exploit_field
+#   cisa_kev   + kev
+# Sidecar stores doc_type + publisher + parser_role; extract stamps kind.
+# ---------------------------------------------------------------------------
+[[sources]]
+name        = "NVD CVE API"
+url         = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+publisher   = "NVD"
+doc_type    = "nvd_record"
+source_tier = 3
+parser_role = "cpe"
+# documents = ["https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2024-3400"]
+
+[[sources]]
+name        = "GitHub Security Advisories"
+url         = "https://api.github.com/advisories"
+publisher   = "GitHub"
+doc_type    = "ghsa"
+source_tier = 3
+parser_role = "reviewed"
+# documents = ["https://api.github.com/advisories/GHSA-jfh8-c2jp-5v3q"]
+
+[[sources]]
+name        = "CISA KEV Catalog"
+url         = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+publisher   = "CISA"
+doc_type    = "cisa_kev"
+source_tier = 3
+parser_role = "kev"
+# documents = ["https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"]

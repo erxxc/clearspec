@@ -63,6 +63,10 @@ class Source(BaseModel):
     # documents from the index page at `url` is HTML-discovery work (WS-3).
     # Defaults keep parsing backward-compatible with pre-WS-2b config files.
     documents: tuple[str, ...] = ()
+    # GEI-14: ingest discriminator for advisory JSON sources (nvd_record/ghsa/
+    # cisa_kev). Required when doc_type is advisory; attested via KIND_COMPAT.
+    # Sidecar stores this — never source_record_kind. Foundry sources omit it.
+    parser_role: str | None = None
 
 
 class Config(BaseModel):
