@@ -48,6 +48,7 @@ class SourceRef:
     source_tier: int
     publisher: str | None = None     # sidecar publisher; run_ingest falls back to `name`
     documents: tuple[str, ...] = ()  # explicit document URLs (WS-2b direct-URL scope; HTML discovery is WS-3)
+    parser_role: str | None = None   # GEI-14 advisory discriminator; None for foundry PDF
 
 
 @dataclass(frozen=True)

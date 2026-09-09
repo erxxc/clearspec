@@ -1,0 +1,45 @@
+{
+  "ghsa_id": "GHSA-jfh8-c2jp-5v3q",
+  "cve_id": "CVE-2021-44228",
+  "url": "https://api.github.com/advisories/GHSA-jfh8-c2jp-5v3q",
+  "html_url": "https://github.com/advisories/GHSA-jfh8-c2jp-5v3q",
+  "summary": "Remote code injection in Log4j",
+  "description": "# Summary\n\nLog4j versions prior to 2.16.0 are subject to a remote code execution vulnerability via the ldap JNDI parser.\nAs per [Apache's Log4j security guide](https://logging.apache.org/log4j/2.x/security.html): Apache Log4j2 <=2.14.1 JNDI features used in configuration, log messages, and parameters do not protect against attacker controlled LDAP and other JNDI related endpoints. An attacker who ",
+  "type": "reviewed",
+  "severity": "critical",
+  "identifiers": [
+    {
+      "value": "GHSA-jfh8-c2jp-5v3q",
+      "type": "GHSA"
+    },
+    {
+      "value": "CVE-2021-44228",
+      "type": "CVE"
+    }
+  ],
+  "vulnerabilities": [
+    {
+      "package": {
+        "ecosystem": "maven",
+        "name": "org.apache.logging.log4j:log4j-core"
+      },
+      "vulnerable_version_range": ">= 2.13.0, < 2.15.0",
+      "first_patched_version": "2.15.0",
+      "vulnerable_functions": []
+    },
+    {
+      "package": {
+        "ecosystem": "maven",
+        "name": "org.apache.logging.log4j:log4j-core"
+      },
+      "vulnerable_version_range": ">= 2.4, < 2.12.2",
+      "first_patched_version": "2.12.2",
+      "vulnerable_functions": []
+    }
+  ],
+  "published_at": "2021-12-10T00:40:56Z",
+  "updated_at": "2025-10-22T19:13:26Z",
+  "withdrawn_at": null,
+  "source_record_kind": "cisa_kev",
+  "ghsa_reviewed": true
+}

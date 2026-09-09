@@ -18,8 +18,10 @@ from .base import (
     write_extraction_artifact,
     write_sidecar,
 )
-from .fetch import FetchedDoc, FetchError, fetch_url, looks_like_pdf
+from .advisory import AdvisoryJsonFetcher
+from .fetch import FetchedDoc, FetchError, fetch_url, looks_like_json, looks_like_pdf
 from .foundry import FoundryFetcher
+from .watchlist import WatchlistFetcher
 from .pipeline import (
     ADVISORY_DOC_TYPES,
     ForgetReport,
@@ -51,8 +53,11 @@ __all__ = [
     "FetchedDoc",
     "FetchError",
     "fetch_url",
+    "looks_like_json",
     "looks_like_pdf",
+    "AdvisoryJsonFetcher",
     "FoundryFetcher",
+    "WatchlistFetcher",
     "ForgetReport",
     "IngestReport",
     "ADVISORY_DOC_TYPES",
