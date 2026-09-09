@@ -1,26 +1,20 @@
-"""analyze — cross-source corroboration and divergence detection (FUTURE WORK).
+"""analyze — cross-source corroboration and the per-CVE conflict ship artifact.
 
-This module is intentionally empty this phase. It will read claims from the store
-(never touching SQLite directly — it goes through store.db) and answer the
-questions that make this an analyst tool rather than a scraper:
-
-  Corroboration
-    Do independent sources agree on the same metric for the same entity? Group
-    claims by (entity, normalized metric), compare values within tolerance, and
-    weight agreement by source_tier (conference > foundry > vendor). Populate
-    claim.corroboration.status and related_claim_ids.
-
-  Divergence
-    Where do sources contradict each other, and does the disagreement track with
-    tier or with disclosed conditions? A vendor's "2.5x" that only holds under
-    sparsity, against a foundry's iso-condition number, is a divergence the tool
-    must surface rather than average away. Relative claims are compared as
-    ratios against their stated baselines — never as reconstructed absolutes.
-
-Design constraint: analysis is read-only over the store and must preserve the
-schema's normalization rules (no relative->absolute conversion).
+Library entry points (CLI is a thin wrapper):
+  run_analysis / analyze_claims — derive-on-read corroboration over the store
+  conflict_report / build_conflict_report — GEI-13 per-CVE conflict report
 """
 
+from .conflict_report import (
+    QUOTE_SPAN_MAX,
+    ClaimSide,
+    ConflictGroup,
+    ConflictReport,
+    CveConflictReport,
+    bound_quote_span,
+    build_conflict_report,
+    conflict_report,
+)
 from .corroborate import (
     Assessment,
     AnalysisReport,
@@ -28,4 +22,17 @@ from .corroborate import (
     run_analysis,
 )
 
-__all__ = ["Assessment", "AnalysisReport", "analyze_claims", "run_analysis"]
+__all__ = [
+    "Assessment",
+    "AnalysisReport",
+    "analyze_claims",
+    "run_analysis",
+    "QUOTE_SPAN_MAX",
+    "ClaimSide",
+    "ConflictGroup",
+    "ConflictReport",
+    "CveConflictReport",
+    "bound_quote_span",
+    "build_conflict_report",
+    "conflict_report",
+]

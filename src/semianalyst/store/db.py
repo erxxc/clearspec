@@ -242,6 +242,8 @@ class ClaimView:
     version_range: dict | None = None
     exploit_status: str | None = None
     workaround_text: str | None = None
+    # GEI-13: citation quote for conflict-report ship artifact (schema Span2000).
+    quote_span: str = ""
 
     def advisory_group_key(self) -> tuple[str, str, str]:
         """GEI-9 grouping key (cve_id, package_or_product, claim_class).
@@ -453,7 +455,8 @@ def get_claims_for_analysis(conn: sqlite3.Connection) -> list[ClaimView]:
             "       c.cmp_is_relative, c.cmp_baseline_entity, c.cond_sparsity, "
             "       c.completeness, d.source_tier, d.publisher, "
             "       c.claim_class, c.source_record_kind, c.cve_id, "
-            "       c.version_range, c.exploit_status, c.workaround_text "
+            "       c.version_range, c.exploit_status, c.workaround_text, "
+            "       c.cite_quote_span "
             "FROM claim c JOIN document d ON c.doc_id = d.doc_id"
         ).fetchall()
     except sqlite3.OperationalError as exc:
@@ -477,6 +480,7 @@ def get_claims_for_analysis(conn: sqlite3.Connection) -> list[ClaimView]:
             version_range=vr,
             exploit_status=r["exploit_status"],
             workaround_text=r["workaround_text"],
+            quote_span=r["cite_quote_span"] or "",
         ))
     return out
 

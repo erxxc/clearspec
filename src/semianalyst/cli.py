@@ -21,7 +21,7 @@ import unicodedata
 import typer
 
 from . import store
-from .analyze import run_analysis
+from .analyze import conflict_report, run_analysis
 from .config import load_config
 from .extract.pipeline import run_extract, run_rebuild
 from .ingest import SidecarCollision
@@ -241,6 +241,54 @@ def report() -> None:
                 f"  {_ansi_safe(c.field)}: {what}"
                 f" from {_ansi_safe(c.doc_id)}"
             )
+
+
+
+@app.command("conflict-report")
+def conflict_report_cmd(
+    cve_id: str = typer.Option(
+        None,
+        help="Optional CVE id to narrow the report (e.g. CVE-2024-21626).",
+    ),
+) -> None:
+    """Print the per-CVE conflict ship artifact (not a CVE feed).
+
+    Surfaces contradicted (and related weakly_corroborated) groups for
+    affected_range / patched_in / exploit_status with each side's bounded,
+    display-sanitized quote_span. Never picks a winning range or kind.
+    """
+    try:
+        report = conflict_report(load_config(), cve_id=cve_id)
+    except store.StoreNotInitialized as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    if not report.cves:
+        typer.echo("no advisory conflicts in the store — nothing to report yet.")
+        return
+    for cve in report.cves:
+        typer.echo(f"CVE {_ansi_safe(cve.cve_id)}")
+        for g in cve.groups:
+            line = (
+                f"  [{_ansi_safe(g.status)}] {_ansi_safe(g.claim_class)}"
+                f" {_ansi_safe(g.package_or_product)}"
+            )
+            if g.set_relation:
+                line += f" set_relation={_ansi_safe(g.set_relation)}"
+            line += f" confidence={_ansi_safe(g.confidence)}"
+            if g.flags:
+                line += f" flags={g.flags}"
+            if g.favored_tier is not None:
+                line += f" favored_tier={g.favored_tier}"
+            typer.echo(line)
+            for side in g.sides:
+                kind = side.source_record_kind or "-"
+                span = _ansi_safe(side.quote_span)
+                typer.echo(
+                    f"    side doc={_ansi_safe(side.doc_id)}"
+                    f" kind={_ansi_safe(kind)}"
+                    f" tier={side.source_tier}"
+                    f" quote={span!r}"
+                )
 
 
 if __name__ == "__main__":
