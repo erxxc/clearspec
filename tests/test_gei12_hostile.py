@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import unicodedata
 from pathlib import Path
 
@@ -434,7 +435,10 @@ def test_kev_exploit_status_does_not_speak_to_range():
 def test_advisory_honest_golden_regression(tmp_config: Config, tmp_path: Path):
     """Pin GEI-9 golden contradicted assessments when fixtures are present."""
     if not FIXTURES.exists():
-        pytest.skip("advisory_golden fixtures not present")
+        reason = "advisory_golden fixtures not present"
+        if os.environ.get("CI"):
+            pytest.fail(reason)
+        pytest.skip(reason)
     from tests.test_gei11_operator_ingest import (
         GOLDEN, _replay_for_goldens, _source_json,
     )
