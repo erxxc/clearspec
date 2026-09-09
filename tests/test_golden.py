@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -59,10 +60,14 @@ def _expected(case_dir: Path) -> dict:
 def test_golden_offline_replay(case_dir: Path):
     recording = case_dir / "llm_response.json"
     if not recording.exists():
-        pytest.skip(
+        reason = (
             f"no recorded llm_response.json for {case_dir.name} — "
             "run `uv run pytest --run-live --record` with ANTHROPIC_API_KEY"
         )
+        # Local: skip (never fabricate). CI: fail — a missing recording is not green.
+        if os.environ.get("CI"):
+            pytest.fail(reason)
+        pytest.skip(reason)
     prompt = PromptVersion.load(PROMPT_NAME)
     cfg = load_config()
     recorded = json.loads(recording.read_text())

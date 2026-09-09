@@ -38,6 +38,32 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_live)
 
 
+def pytest_sessionfinish(session, exitstatus):
+    """CI (GitHub Actions sets CI=true) must not go green on skipped tests.
+
+    Offline goldens skip locally when a recording is missing; that skip is a
+    failure for CI readiness. Live tests are deselected with `-m "not live"`,
+    so they are not skips. Local runs without CI=true are unchanged.
+    """
+    if os.environ.get("CI") != "true":
+        return
+    if exitstatus not in (0, pytest.ExitCode.OK):
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    skipped = [] if reporter is None else reporter.stats.get("skipped", [])
+    if skipped:
+        if reporter is not None:
+            reporter.write_line("")
+            reporter.write_sep(
+                "=",
+                "CI forbids skipped tests (missing recordings are a failure)",
+                red=True,
+            )
+            for rep in skipped:
+                reporter.write_line(str(getattr(rep, "longrepr", rep.nodeid)))
+        session.exitstatus = int(pytest.ExitCode.TESTS_FAILED)
+
+
 @pytest.fixture
 def record(request) -> bool:
     return request.config.getoption("--record")

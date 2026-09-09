@@ -29,5 +29,6 @@ jobs:
       - name: Install the project
         run: uv sync --locked --all-extras --dev
 
+      # GitHub Actions sets CI=true; missing-recording skips fail (see conftest).
       - name: Run offline tests
         run: uv run pytest -m "not live" --tb=short
