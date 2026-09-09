@@ -242,10 +242,23 @@ def test_advisory_display_sanitizer():
     assert "\u202e" not in cleaned
     assert all(unicodedata.category(ch) != "Cf" for ch in cleaned)
 
+    import ast
     import inspect
+    import re
     src = inspect.getsource(report_cmd)
-    assert "workaround_text" not in src
     assert "_ansi_safe" in src
+    # Comment may name the injection surface; executable code must not load
+    # workaround_text off the assessment (no attribute access / f-string field).
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "workaround_text":
+            raise AssertionError("report() must not read assessment.workaround_text")
+        if isinstance(node, ast.Constant) and node.value == "workaround_text":
+            raise AssertionError("report() must not interpolate workaround_text as a value")
+    # Strip comments/docstrings then forbid attribute-style access token
+    no_comments = re.sub(r"#.*?$", "", src, flags=re.M)
+    assert "a.workaround_text" not in no_comments
+    assert "{a.workaround_text" not in no_comments
 
 
 # ---------------------------------------------------------------------------
@@ -473,11 +486,19 @@ def test_advisory_flag_budget():
         "missing_version_range",
     }
     # set_relation:* is dynamic; allowed as a prefix
+    import ast
     import inspect
+    import re
     from semianalyst.analyze import corroborate as cmod
     src = inspect.getsource(cmod._assess_advisory)
     # No auto-resolve / winner flags smuggled in
     assert "winning" not in src.lower() or "never" in src.lower()
-    assert "resolved" not in src  # no silent-resolve status flag
-    # Document allowlist for reviewers
+    # Forbid a silent-resolve *status/flag token*, not the substring inside
+    # unresolved_baseline.
+    forbidden = re.compile(r"(?<![A-Za-z_])resolved(?![A-Za-z_])")
+    assert not forbidden.search(src), "silent-resolve token found in _assess_advisory"
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and node.value == "resolved":
+            raise AssertionError("_assess_advisory must not emit status/flag 'resolved'")
     assert "missing_version_range" in known
