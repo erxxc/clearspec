@@ -7,8 +7,9 @@ reverse once data and prompts accumulate.
 The schema defines every structure; pydantic models (`store/models.py`) and the
 SQLite DDL (`store/migrations/`) are both derived from it. Change the schema
 first; regenerate the models and add a migration — never the other way around.
-**`schema/extraction_schema_v4.yaml` is current**; `_v1`/`_v2`/`_v3` are retained
-unedited. v2 added per-attribute grounding (`entity.attribute_citations`) and a
+**Two domain packs share one engine: `schema/extraction_schema_v5.yaml` is the
+ADVISORY pack (current, GEI-7) and `schema/extraction_schema_v4.yaml` is the
+FOUNDRY pack (retained unedited)**; `_v1`/`_v2`/`_v3` are retained unedited. v2 added per-attribute grounding (`entity.attribute_citations`) and a
 fail-safe `unknown` `citation.location_type`; v3 added `weakly_corroborated` as a
 `corroboration.status` verdict value (a group that agrees within tolerance but has
 <2 non-suspect members — a clean number + an honestly-disclosed sparsity number)
@@ -17,7 +18,19 @@ the per-row `corr_status`/`corr_related_claim_ids` columns (a per-group verdict 
 no honest per-row home) and dropped the `cmp_baseline_entity` FK. v4 (WS-2a,
 2026-08-18 gate) added the persisted `conflict` record and two-layer content
 bounds (pydantic length+charset; DDL length CHECKs — migration 0004), and
-documented the extraction-artifact fold.
+documented the extraction-artifact fold. v5 (GEI-7, 2026-09-03) is a PARALLEL
+pack, not a supersession: advisory `doc_type`s (`nvd_record | ghsa |
+vendor_advisory | cisa_kev | researcher_writeup`), `entity_type` `cve | package |
+product | advisory`, `claim_class` (`affected_range | patched_in | cvss |
+exploit_status | workaround`), a STRUCTURED `version_range` interval (the
+verbatim string lives only in `quote_span`), and `source_record_kind` — attested
+at extract from the sidecar's operator-supplied `parser_role` via
+`store.attested_kind`, NEVER taken from the model or the document body
+(migration 0005). GEI-6 locked decisions: never auto-resolve (tiers weight and
+order, no tier wins), claim-class-specific kind ranking, CVE identity is a
+grouping-key problem. Advisory docs always select `extract_advisory_v1`
+(`extract.prompts.prompt_name_for_doc_type`); `config.toml`'s `prompt_version`
+is the foundry default only.
 
 ## The claim is the atomic unit — and its integrity rules are non-negotiable
 - **Every extracted value cites a source span** — code-enforced, not trusted to
@@ -237,20 +250,27 @@ gitignored in full.
 
 ## Module map
 - `ingest/`  — fetchers + content-addressed raw storage + provenance sidecars +
-  extraction-artifact layout + `forget` quarantine (operator path AND the
-  WS-2b direct-URL network fetcher both live; HTML discovery of document URLs
-  from index pages: WS-3)
-- `extract/` — raw doc → schema records via a versioned prompt; `run_extract`
-  wires ingest (sidecar) → extractor → `persist_extraction` + artifact;
-  `run_rebuild` refolds the DB from artifacts
+  extraction-artifact layout + `forget` quarantine (operator path, the WS-2b
+  direct-URL PDF fetcher, and the GEI-14 curated advisory JSON fetcher
+  (`AdvisoryJsonFetcher`: NVD API / GHSA / CISA KEV, JSON magic instead of
+  `%PDF-`, `parser_role` into the sidecar) all live; HTML discovery of
+  document URLs from index pages: WS-3)
+- `extract/` — raw doc → schema records via a versioned prompt (selected per
+  `doc_type`: advisory types → `extract_advisory_v1`, else the configured
+  foundry prompt); `run_extract` wires ingest (sidecar) → extractor →
+  `persist_extraction` + artifact, stamping `source_record_kind` from the
+  sidecar; `run_rebuild` refolds the DB from artifacts
 - `store/`   — SQLite persistence + conflict-recording entity reconciliation;
   sole DB owner
 - `analyze/` — cross-source corroboration + divergence (tolerance grouping over
   normalized keys, suspect members excluded from the corroborated count, H1
   publisher floor, tier-blind `favored_tier` on contradictions, advisory flags,
-  conflict surfacing; derive-on-read, read-only over `store`)
+  conflict surfacing; derive-on-read, read-only over `store`). Advisory groups
+  key on `(cve_id, package_or_product, claim_class)` with SET comparison of
+  version intervals (`version_sets.py`: overlap/subset/disjoint, GEI-9) and
+  `conflict_report.py` builds the per-CVE conflict ship artifact (GEI-13)
 - `cli.py`   — thin argument layer over the above (`db init|rebuild`, `ingest`,
-  `ingest-file`, `extract`, `report`, `forget`)
+  `ingest-file`, `extract`, `report`, `conflict-report`, `forget`)
 
 ## Testing (ENFORCE posture)
 `tests/` uses a golden-fixture harness: `tests/fixtures/<doc_id>/raw.pdf` +

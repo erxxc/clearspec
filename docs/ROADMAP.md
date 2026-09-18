@@ -7,17 +7,124 @@ history — those live where they are authoritative:
 - **Architectural rules + the Class A deferred-decision definitions:** `CLAUDE.md`.
   This file _references_ Class A items (K/G/H/…) by name; it never redefines them.
 - **Per-gate decisions and their rationale:** `docs/reviews/<date>-<workstream>-<plan|precommit>/resolution.md`.
-- **The data model:** `schema/extraction_schema_v3.yaml` (current).
+- **The data model:** `schema/extraction_schema_v5.yaml` (advisory pack, current)
+  and `schema/extraction_schema_v4.yaml` (foundry pack, retained).
 
 Keep this file honest on every workstream boundary: when a slice lands, move its
 row from *Open* to *Built*; when a Class A item is retired, strike it here and in
 CLAUDE.md in the same commit.
 
-_Last updated: 2026-08-20._
+_Last updated: 2026-09-18._
 
 ---
 
-## Current state — the pipeline is wired end to end (WS-1 + WS-2); direct-URL network fetch is live
+## Current state — the advisory pack (M0–M2) is shipped on the WS-1/WS-2 engine; first live advisory run done 2026-09-18
+
+The product wedge is now **advisory corroboration** (Linear project ClearSpec,
+PRD in Linear; `conflict-report` is the ship artifact). The foundry pack stays
+built and tested; the engine rows below apply to both packs.
+
+| Stage (advisory pack) | State | Notes |
+|---|---|---|
+| Schema v5 + migration 0005 (GEI-7) | **BUILT** | Parallel pack, v4 unedited. `claim_class`, structured `version_range`, `source_record_kind` attested from sidecar `parser_role`. GEI-6 locks: never auto-resolve; claim-class kind ranking; CVE identity is a grouping key. |
+| `extract_advisory_v1` (GEI-8) | **BUILT, frozen** | Selected per `doc_type` (`prompt_name_for_doc_type`); offline golden `tests/test_advisory_golden.py` over the GEI-10 corpus (runc, Jenkins, OpenSSH, PAN-OS, HTTP/2 rapid reset). |
+| Version-set grouping (GEI-9) | **BUILT** | `(cve_id, package_or_product, claim_class)`; overlap/subset/disjoint on intervals; cvss keeps the numeric ruler; exploit_status is enum agreement. |
+| Operator advisory ingest (GEI-11) | **BUILT** | `ingest-file` accepts JSON or PDF + `--parser-role`; kind stamped at extract. |
+| Adversarial precommit (GEI-12) | **PASSED** | `docs/reviews/2026-09-03-advisory-pack-precommit/`; `tests/test_gei12_hostile.py` (poisoned NVD-shaped JSON, forget/refold, kind stamp, sanitizer). Live advisory injection deferred — trigger: key + `--run-live` advisory case. |
+| Curated JSON ingest (GEI-14, M1) | **BUILT** | `AdvisoryJsonFetcher`: NVD API / GHSA / CISA KEV `documents = [...]` URLs, JSON magic, same WS-2b transport policy. Offline CI on `main` (PR #12). |
+| Conflict report (GEI-13, M2) | **BUILT** | `analyze.conflict_report` + `conflict-report` CLI; contradicted + related weakly_corroborated groups with bounded, sanitized quote spans per side. Dogfooded offline on replay (GEI-53). |
+| **Live advisory run (2026-09-18)** | **DONE, scratch only** | See *Live run 2026-09-18* below. Not yet a committed `@live` test — `test_gei14_json_ingest.py`'s live fetch case is unconditionally skipped. |
+
+### Live run 2026-09-18 — what the real feeds + real model showed
+
+Scratch run (not committed; `data/` under the session scratchpad), real
+feeds + real model (`claude-opus-4-8`, `extract_advisory_v1`), zero code changes.
+Watchlist: NVD API (`parser_role = "cpe"`) for CVE-2024-21626 / -23897 / -6387
+/ -3400 and the four matching GHSA records (2 reviewed, 2 unreviewed). CISA KEV
+deliberately left out (see Next, item 3).
+
+| Step | Result |
+|---|---|
+| `run_ingest` | 8/8 fetched, 0 errors, 23 s at 20 rpm. HTTPS-only + JSON magic + sidecar `parser_role` all behaved. |
+| `run_extract` | 8/8 extracted, 0 errors, 259 s (~32 s/doc). 13 entities, 45 claims, 1 `entity_conflict` (`alias_collision`). |
+| `conflict-report` | 4 CVEs, 8 contradicted groups — **but almost none are the cross-source conflicts the product is for.** |
+
+What the live output proves, in priority order (each is a fork for the next
+plan gate, none is fixed yet):
+
+1. **CVE entities are dropped 4/4 by validate** — `entity.vendor` is required
+   (`Text80`, DDL `NOT NULL`) and a CVE has no vendor "as written", so the model
+   emits `null` → `shape invalid at ('vendor',)` → every claim pointing at the
+   CVE entity (all CVSS `cve_*` claims) cascades to `references an entity absent
+   from this document's proposal`. The golden proposals were hand-written around
+   this. Fork: nullable `vendor` for `entity_type = cve` (schema v6 — v5 is
+   frozen) vs. prompt-side default.
+2. **Every `exploit_status` claim is dropped** (`shape invalid at
+   ('exploit_status',)`, 3/3 live). The prompt's shape block shows
+   `"exploit_status": null` and never lists the enum (`known_exploited |
+   no_known_exploit | disputed`), so the model invents values. Until this is
+   fixed the KEV/exploit-status surface is invisible live regardless of item 1
+   in Next. Fix is a prompt change → `extract_advisory_v2` (v1 is frozen) + the
+   golden re-recorded.
+3. **Cross-source entity identity is the real blocker.** GHSA yields
+   `pkg_runc` (package, vendor `opencontainers`, name
+   `github.com/opencontainers/runc`); NVD yields `prod_runc_cpe` (product, vendor
+   `linuxfoundation`, name `runc`). GHSA's alias `runc` collides with the NVD
+   entity's name and G3 correctly refuses the union (the one `entity_conflict`).
+   Group key `(cve_id, package_or_product, claim_class)` therefore never joins
+   the two sources: the NVD runc range sits `uncorroborated` and the GHSA range
+   only "contradicts" its own prose restatement. The golden corpus hand-aligned
+   entity ids, which hid this. Fork: a per-CVE identity layer (purl/cpe
+   normalization, or grouping on `cve_id` + normalized product token instead of
+   entity_id) — a schema/analyze decision, not a prompt tweak.
+4. **Same-document branch ranges read as contradictions.** One NVD record lists
+   per-branch intervals (PAN-OS 10.2/11.0/11.1, macOS 12/13/14, Jenkins LTS vs
+   weekly); each became its own claim and analyze reports the set as
+   `disjoint` → `contradicted`. 6 of the 8 live contradicted groups are this
+   shape. Rule needed: claims from one `(doc_id, source_record_kind)` are ONE
+   side — union their intervals before comparing — or carry a branch dimension.
+   Same for GHSA `vulnerable_version_range` vs its prose restatement (`subset`).
+5. Honest positives: grounding held (2 ungrounded product names nulled, not
+   invented); `alias_collision` fired exactly where it should; sanitizer +
+   bounds passed on real server text; idempotency/revision paths untouched.
+
+The dogfood ticket (GEI-53) proved the pipeline on replayed proposals; this run
+is the first evidence from the real model on real feeds, and it says the pack's
+next milestone is **identity + same-document semantics**, not more sources.
+
+### Next (advisory pack) — ordered
+
+1. **Plan gate for the four live forks above** (CVE vendor nullability,
+   `extract_advisory_v2` exploit_status enum, cross-source identity, same-doc
+   union). Items 1–2 are cheap and unblock measurement; 3–4 decide whether
+   `conflict-report` ever shows an NVD-vs-GHSA row on live data.
+2. **Commit a live advisory anchor.** Promote the 2026-09-18 scratch run into a
+   `@live` test (NVD + GHSA for one golden CVE → `conflict-report`) and record
+   its `llm_response.json` so the offline suite replays real advisory model
+   output, not only hand-written proposals. `test_gei14_json_ingest.py`'s live
+   fetch case is unconditionally skipped today.
+3. **CISA KEV needs a per-CVE cut before extract.** The live catalog is ~1.7 MB
+   (`known_exploited_vulnerabilities.json`) and `run_extract` sends the whole
+   raw blob to the model as one document. The GEI-14 fetcher will store it, but
+   extraction cannot honestly ground a 1.7 MB JSON in one call. Options: filter
+   the catalog to the watchlist's CVE ids at ingest (a derived blob needs its
+   own sidecar provenance — "raw bytes are stored as-is" is otherwise broken),
+   or a per-CVE KEV lookup source. Moot until Next item 1 lands (exploit_status
+   claims are dropped anyway).
+4. **NVD CNA vs CPE at one URL.** Both roles read the same NVD API response;
+   with `parser_role = "cpe"` the model still extracts the CNA range strings and
+   they get stamped `nvd_cpe` (visible live: Jenkins `patched_in` sides quote
+   CNA `status: unaffected` records under kind `nvd_cpe`). Either split the
+   record at ingest (the golden corpus split it by hand) or make the
+   prompt/validate honour the role.
+5. **Golden fixture URL typo:** `tests/test_gei11_operator_ingest.py` cites
+   `GHSA-xr7r-f8xq-rv7p` for runc; the live id is `GHSA-xr7r-f8xq-vfvv`. Offline
+   identity only (the URL is a doc_id slug and the GEI-13 golden asserts it),
+   so fix it together with the next golden re-record, not alone.
+6. Deferred, unchanged: HTML discovery (WS-3), vendor HTML pages, bridges to
+   other tools, detection-spec export.
+
+pipeline is wired end to end (WS-1 + WS-2); direct-URL network fetch is live
 
 | Stage | State | Notes |
 |---|---|---|
