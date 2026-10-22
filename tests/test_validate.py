@@ -58,7 +58,7 @@ def _golden_proposal() -> dict:
                 "chip": None,
                 "attribute_citations": {
                     "node.transistor_type": {"page": 1, "location_type": "body",
-                        "quote_span": "N2 is TSMC's first gate-all-around (GAA) nanosheet process node."},
+                        "quote_span": "N2 is TSMC’s first gate-all-around (GAA) nanosheet process node."},
                     "node.backside_power": {"page": 1, "location_type": "body",
                         "quote_span": "N2 does not use backside power delivery."},
                     "node.hvm_date_claimed": {"page": 1, "location_type": "body",

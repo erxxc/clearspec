@@ -5,9 +5,7 @@
       "entity_type": "process_node",
       "vendor": "TSMC",
       "name": "N2",
-      "aliases": [
-        "N2"
-      ],
+      "aliases": [],
       "node": {
         "density_mtx_mm2": null,
         "transistor_type": "gaa_nanosheet",
@@ -18,7 +16,7 @@
       "chip": null,
       "attribute_citations": {
         "node.transistor_type": {
-          "quote_span": "N2 is TSMC's first gate-all-around (GAA) nanosheet process node.",
+          "quote_span": "N2 is TSMC\u2019s first gate-all-around (GAA) nanosheet process node.",
           "page": 1,
           "location_type": "body"
         },
@@ -39,9 +37,7 @@
       "entity_type": "process_node",
       "vendor": "TSMC",
       "name": "N3E",
-      "aliases": [
-        "N3E"
-      ],
+      "aliases": [],
       "node": {
         "density_mtx_mm2": null,
         "transistor_type": "finfet",
