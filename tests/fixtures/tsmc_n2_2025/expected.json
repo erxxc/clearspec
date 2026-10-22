@@ -1,12 +1,14 @@
 {
-  "_note": "Golden expected output (schema v2). Shape matches extract.ExtractionResult.model_dump(mode='json'). Every entity attribute now carries a grounded attribute_citation, and every location_type is 'unknown' — validate.py forces that under flat-text extraction (fail-safe), rather than laundering claims into 'body'. The relative speed claim keeps its ratio (1.15x) and names its baseline (N3E). All quote_spans are verbatim substrings of raw.pdf.",
+  "_note": "Golden expected output (schema v2). Shape matches extract.ExtractionResult.model_dump(mode='json'). Every entity attribute now carries a grounded attribute_citation, and every location_type is 'unknown' \u2014 validate.py forces that under flat-text extraction (fail-safe), rather than laundering claims into 'body'. The relative speed claim keeps its ratio (1.15x) and names its baseline (N3E). All quote_spans are verbatim substrings of raw.pdf.",
   "entities": [
     {
       "entity_id": "tsmc_n2",
       "entity_type": "process_node",
       "vendor": "TSMC",
       "name": "N2",
-      "aliases": ["N2"],
+      "aliases": [
+        "N2"
+      ],
       "node": {
         "density_mtx_mm2": null,
         "transistor_type": "gaa_nanosheet",
@@ -18,7 +20,7 @@
       "attribute_citations": {
         "node.transistor_type": {
           "page": 1,
-          "quote_span": "N2 is TSMC's first gate-all-around (GAA) nanosheet process node.",
+          "quote_span": "N2 is TSMC\u2019s first gate-all-around (GAA) nanosheet process node.",
           "location_type": "unknown"
         },
         "node.backside_power": {
@@ -38,7 +40,9 @@
       "entity_type": "process_node",
       "vendor": "TSMC",
       "name": "N3E",
-      "aliases": ["N3E"],
+      "aliases": [
+        "N3E"
+      ],
       "node": {
         "density_mtx_mm2": null,
         "transistor_type": "finfet",
@@ -80,7 +84,9 @@
         "precision": null,
         "sparsity": null,
         "thermal_config": null,
-        "stated_caveats": ["at iso-power"]
+        "stated_caveats": [
+          "at iso-power"
+        ]
       },
       "completeness": "complete",
       "citation": {

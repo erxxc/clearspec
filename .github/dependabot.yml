@@ -1,0 +1,16 @@
+# Keep the lockfile and pinned actions current. Security audit 2026-10-22:
+# pypdf sat 7 minor versions behind with 21 open advisories because nothing
+# watched the lock. Dependabot PRs still go through the offline CI gate.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      python-deps:
+        patterns: ["*"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
